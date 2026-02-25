@@ -39,13 +39,9 @@ class CorretoraApp:
         self.session = obter_sessao(engine)
         self.finance_engine = FinanceEngine(session=self.session)
 
-        # FilePicker para importar PDF
-        self.file_picker = ft.FilePicker(on_result=self._on_pdf_selected)
-        self.page.overlay.append(self.file_picker)
-
-        # FilePicker para salvar exportações
-        self.save_picker = ft.FilePicker(on_result=self._on_save_selected)
-        self.page.overlay.append(self.save_picker)
+        # FilePicker — Service no Flet 0.81 (vai em page.services, não overlay)
+        self.file_picker = ft.FilePicker()
+        self.page.services.append(self.file_picker)
 
         # Construir interface
         self.build_ui()
@@ -2816,21 +2812,20 @@ class CorretoraApp:
             padding=25,
         )
 
-    def importar_pdf(self, e):
-        """Abre seletor de arquivo nativo para importar PDF"""
-        self.file_picker.pick_files(
+    async def importar_pdf(self, e):
+        """Abre seletor de arquivo nativo e processa o PDF selecionado"""
+        arquivos = await self.file_picker.pick_files(
             dialog_title="Selecionar Proposta PDF",
             allowed_extensions=["pdf"],
             allow_multiple=False,
         )
 
-    def _on_pdf_selected(self, e: ft.FilePickerResultEvent):
-        """Callback quando um PDF é selecionado pelo FilePicker"""
-        if not e.files:
+        if not arquivos:
+            self.show_snackbar("Nenhum arquivo selecionado.", self.text_secondary)
             return
 
-        file_path = e.files[0].path
-        file_name = e.files[0].name
+        file_path = arquivos[0].path
+        file_name = arquivos[0].name
 
         self.show_snackbar(f"⏳ Processando {file_name}...", self.primary_color)
 
@@ -2849,15 +2844,10 @@ class CorretoraApp:
                 self.show_snackbar(mensagem, self.accent_color)
                 self.atualizar_dashboard(None)
             else:
-                self.show_snackbar(f"❌ Erro: {resultado['mensagem']}", self.error_color)
+                self.show_snackbar(f"❌ {resultado['mensagem']}", self.error_color)
 
         except Exception as ex:
             self.show_snackbar(f"❌ Erro ao processar PDF: {str(ex)}", self.error_color)
-
-    def _on_save_selected(self, e: ft.FilePickerResultEvent):
-        """Callback quando um caminho de salvamento é selecionado"""
-        # Reservado para exportações futuras
-        pass
 
     def _importar_pdf_LEGADO(self, e):
         """Abre dialog para importar PDF — LEGADO (substituído por FilePicker)"""
