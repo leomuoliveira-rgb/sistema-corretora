@@ -39,6 +39,14 @@ class CorretoraApp:
         self.session = obter_sessao(engine)
         self.finance_engine = FinanceEngine(session=self.session)
 
+        # FilePicker para importar PDF
+        self.file_picker = ft.FilePicker(on_result=self._on_pdf_selected)
+        self.page.overlay.append(self.file_picker)
+
+        # FilePicker para salvar exportações
+        self.save_picker = ft.FilePicker(on_result=self._on_save_selected)
+        self.page.overlay.append(self.save_picker)
+
         # Construir interface
         self.build_ui()
 
@@ -2809,7 +2817,50 @@ class CorretoraApp:
         )
 
     def importar_pdf(self, e):
-        """Abre dialog para importar PDF"""
+        """Abre seletor de arquivo nativo para importar PDF"""
+        self.file_picker.pick_files(
+            dialog_title="Selecionar Proposta PDF",
+            allowed_extensions=["pdf"],
+            allow_multiple=False,
+        )
+
+    def _on_pdf_selected(self, e: ft.FilePickerResultEvent):
+        """Callback quando um PDF é selecionado pelo FilePicker"""
+        if not e.files:
+            return
+
+        file_path = e.files[0].path
+        file_name = e.files[0].name
+
+        self.show_snackbar(f"⏳ Processando {file_name}...", self.primary_color)
+
+        try:
+            from ocr_engine import processar_pdf
+
+            resultado = processar_pdf(file_path)
+
+            if resultado['sucesso']:
+                dados = resultado['dados_extraidos']
+                mensagem = f"✅ {resultado['mensagem']}"
+                if dados.get('cliente_nome'):
+                    mensagem += f" | Cliente: {dados['cliente_nome']}"
+                if dados.get('valor_bruto', 0) > 0:
+                    mensagem += f" | R$ {dados['valor_bruto']:.2f}"
+                self.show_snackbar(mensagem, self.accent_color)
+                self.atualizar_dashboard(None)
+            else:
+                self.show_snackbar(f"❌ Erro: {resultado['mensagem']}", self.error_color)
+
+        except Exception as ex:
+            self.show_snackbar(f"❌ Erro ao processar PDF: {str(ex)}", self.error_color)
+
+    def _on_save_selected(self, e: ft.FilePickerResultEvent):
+        """Callback quando um caminho de salvamento é selecionado"""
+        # Reservado para exportações futuras
+        pass
+
+    def _importar_pdf_LEGADO(self, e):
+        """Abre dialog para importar PDF — LEGADO (substituído por FilePicker)"""
         caminho_field = ft.TextField(
             label="Caminho do arquivo PDF",
             hint_text="Cole o caminho completo do arquivo aqui",
@@ -2818,50 +2869,23 @@ class CorretoraApp:
         )
 
         def processar_arquivo(e):
-            """Processa o PDF do caminho informado"""
             caminho = caminho_field.value
-
             if not caminho:
                 self.show_snackbar("❌ Informe o caminho do arquivo!", self.error_color)
                 return
-
-            # Fechar dialog
             dialog.open = False
             self.page.update()
-
-            # Mostrar mensagem de processamento
-            self.show_snackbar(f"⏳ Processando PDF...", self.primary_color)
-
+            self.show_snackbar("⏳ Processando PDF...", self.primary_color)
             try:
-                # Processar PDF com OCR Engine
                 from ocr_engine import processar_pdf
-
                 resultado = processar_pdf(caminho)
-
                 if resultado['sucesso']:
-                    # Sucesso - mostrar detalhes
-                    tipo = resultado['tipo_documento']
-                    dados = resultado['dados_extraidos']
-
-                    mensagem = f"✅ {resultado['mensagem']}"
-
-                    self.show_snackbar(mensagem, self.accent_color)
-
-                    # Atualizar dashboard
+                    self.show_snackbar(f"✅ {resultado['mensagem']}", self.accent_color)
                     self.atualizar_dashboard(None)
                 else:
-                    # Erro no processamento
-                    self.show_snackbar(
-                        f"❌ Erro: {resultado['mensagem']}",
-                        self.error_color
-                    )
-
+                    self.show_snackbar(f"❌ Erro: {resultado['mensagem']}", self.error_color)
             except Exception as ex:
-                # Erro inesperado
-                self.show_snackbar(
-                    f"❌ Erro ao processar: {str(ex)}",
-                    self.error_color
-                )
+                self.show_snackbar(f"❌ Erro ao processar: {str(ex)}", self.error_color)
 
         dialog = ft.AlertDialog(
             title=ft.Text("📄 Importar Proposta PDF"),
@@ -2891,56 +2915,6 @@ class CorretoraApp:
         dialog.open = True
         self.page.update()
 
-    def on_pdf_selected_OLD(self, e):
-        """Callback quando um PDF é selecionado - DESABILITADO"""
-        if False:
-            file_path = e.files[0].path
-            file_name = e.files[0].name
-
-            # Mostrar mensagem de processamento
-            self.show_snackbar(
-                f"⏳ Processando {file_name}...",
-                self.primary_color,
-            )
-
-            try:
-                # Processar PDF com OCR Engine
-                from ocr_engine import processar_pdf
-
-                resultado = processar_pdf(file_path)
-
-                if resultado['sucesso']:
-                    # Sucesso - mostrar detalhes
-                    tipo = resultado['tipo_documento']
-                    dados = resultado['dados_extraidos']
-
-                    mensagem = f"✓ {resultado['mensagem']}\n"
-                    mensagem += f"Tipo: {tipo}\n"
-
-                    if dados.get('cliente_nome'):
-                        mensagem += f"Cliente: {dados['cliente_nome']}\n"
-                    if dados.get('valor_bruto', 0) > 0:
-                        mensagem += f"Valor: R$ {dados['valor_bruto']:.2f}"
-
-                    self.show_snackbar(mensagem, self.accent_color)
-
-                    # Atualizar dashboard
-                    self.atualizar_dashboard(None)
-                else:
-                    # Erro no processamento
-                    self.show_snackbar(
-                        f"✗ Erro: {resultado['mensagem']}",
-                        self.error_color
-                    )
-
-            except Exception as ex:
-                # Erro inesperado
-                self.show_snackbar(
-                    f"✗ Erro ao processar PDF: {str(ex)}",
-                    self.error_color
-                )
-        else:
-            self.show_snackbar("Nenhum arquivo selecionado", self.error_color)
 
     def atualizar_dashboard(self, e):
         """Atualiza os dados do dashboard"""
