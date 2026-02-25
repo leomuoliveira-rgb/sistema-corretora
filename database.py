@@ -189,6 +189,16 @@ def criar_banco(database_url='sqlite:///corretora.db'):
     Returns:
         engine: Engine do SQLAlchemy
     """
+    # Importar todos os módulos com modelos para registrá-los no Base
+    try:
+        import modulo_financeiro  # noqa - registra ContaBancaria, CategoriaFinanceira, TransacaoFinanceira, Meta
+    except Exception:
+        pass
+    try:
+        import sistema_parcelas  # noqa - registra parcelas e config_email
+    except Exception:
+        pass
+
     engine = create_engine(database_url, echo=False)
     Base.metadata.create_all(engine)
 

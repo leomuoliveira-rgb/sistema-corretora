@@ -1131,7 +1131,7 @@ class CorretoraApp:
                                     color=badge_color,
                                 ),
                                 bgcolor=badge_bgcolor,
-                                padding=ft.padding.symmetric(horizontal=10, vertical=4),
+                                padding=ft.Padding.symmetric(horizontal=10, vertical=4),
                                 border_radius=20,
                             ),
                             ft.Text(
@@ -1148,7 +1148,7 @@ class CorretoraApp:
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                     bgcolor=self.surface_color,
-                    padding=ft.padding.symmetric(horizontal=16, vertical=12),
+                    padding=ft.Padding.symmetric(horizontal=16, vertical=12),
                     border_radius=10,
                     border=ft.Border.all(1, "#334155"),
                 )
@@ -1163,7 +1163,7 @@ class CorretoraApp:
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             ),
             padding=40,
-            alignment=ft.alignment.center,
+            alignment=ft.Alignment(0, 0),
         )
 
         return ft.Container(
@@ -1598,7 +1598,7 @@ class CorretoraApp:
                                 color="#fca5a5" if lancamentos_pendentes > 0 else "#86efac",
                             ),
                             bgcolor="#450a0a" if lancamentos_pendentes > 0 else "#14532d",
-                            padding=ft.padding.symmetric(horizontal=8, vertical=3),
+                            padding=ft.Padding.symmetric(horizontal=8, vertical=3),
                             border_radius=12,
                         ),
                     ], spacing=10),
@@ -1625,7 +1625,7 @@ class CorretoraApp:
                             size=22, weight=ft.FontWeight.BOLD, color=self.primary_color,
                         ),
                         bgcolor="#1e1b4b",
-                        padding=ft.padding.symmetric(horizontal=16, vertical=8),
+                        padding=ft.Padding.symmetric(horizontal=16, vertical=8),
                         border_radius=12,
                     ),
                 ]),
@@ -2230,7 +2230,7 @@ class CorretoraApp:
                                     size=11, color="#86efac" if cat.tipo == "RECEITA" else "#fca5a5",
                                 ),
                                 bgcolor="#14532d" if cat.tipo == "RECEITA" else "#450a0a",
-                                padding=ft.padding.symmetric(horizontal=8, vertical=2),
+                                padding=ft.Padding.symmetric(horizontal=8, vertical=2),
                                 border_radius=10,
                             ),
                             ft.Text(cat.nome, size=13, color=self.text_primary, expand=True),
@@ -2746,7 +2746,7 @@ class CorretoraApp:
                             padding=10,
                             border_radius=8,
                             width=44,
-                            alignment=ft.alignment.center,
+                            alignment=ft.Alignment(0, 0),
                         ),
                         ft.Column([
                             ft.Text(nome, size=15, weight=ft.FontWeight.BOLD, color=self.text_primary),
@@ -2760,7 +2760,7 @@ class CorretoraApp:
                         ),
                     ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                     bgcolor=self.surface_color,
-                    padding=ft.padding.symmetric(horizontal=16, vertical=12),
+                    padding=ft.Padding.symmetric(horizontal=16, vertical=12),
                     border_radius=10,
                     border=ft.Border.all(1, "#334155"),
                 )
@@ -2788,7 +2788,7 @@ class CorretoraApp:
                                 ft.Text(f"{total_impostos:.2f}%", size=20, weight=ft.FontWeight.BOLD, color=self.error_color),
                             ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
                             bgcolor=self.surface_color,
-                            padding=ft.padding.symmetric(horizontal=20, vertical=10),
+                            padding=ft.Padding.symmetric(horizontal=20, vertical=10),
                             border_radius=10,
                             border=ft.Border.all(1, "#334155"),
                         ),
