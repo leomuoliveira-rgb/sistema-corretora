@@ -980,23 +980,234 @@ class CorretoraApp:
 
     def build_lancamentos_tab(self):
         """Constrói a aba de lançamentos"""
+        from database import Lancamento, Proposta
+        from datetime import date
+
+        hoje = date.today()
+
+        # Buscar todos os lançamentos com proposta
+        lancamentos = (
+            self.session.query(Lancamento)
+            .join(Proposta)
+            .order_by(Lancamento.data_vencimento.asc())
+            .all()
+        )
+
+        total_lancamentos = len(lancamentos)
+        total_pendente = sum(l.valor_esperado for l in lancamentos if not l.status_pago)
+        total_pago = sum(l.valor_esperado for l in lancamentos if l.status_pago)
+        vencidos = sum(1 for l in lancamentos if not l.status_pago and l.data_vencimento < hoje)
+
+        # ---- Funções de ação ----
+        def marcar_pago(lancamento):
+            """Marca um lançamento como pago"""
+            def confirmar(e):
+                try:
+                    lancamento.status_pago = True
+                    self.session.commit()
+                    self.show_snackbar("✅ Lançamento quitado!", self.accent_color)
+                    dialog.open = False
+                    self.page.update()
+                    self.page.clean()
+                    self.build_ui()
+                    self.page.update()
+                except Exception as ex:
+                    self.show_snackbar(f"❌ Erro: {str(ex)}", self.error_color)
+
+            dialog = ft.AlertDialog(
+                title=ft.Text("Confirmar Quitação"),
+                content=ft.Text(
+                    f"Marcar lançamento de R$ {lancamento.valor_esperado:,.2f} "
+                    f"({lancamento.proposta.cliente_nome}) como PAGO?"
+                ),
+                actions=[
+                    ft.TextButton(
+                        content=ft.Text("Cancelar"),
+                        on_click=lambda e: (setattr(dialog, 'open', False), self.page.update()),
+                    ),
+                    ft.FilledButton(
+                        content=ft.Text("✅ Confirmar"),
+                        on_click=confirmar,
+                        style=ft.ButtonStyle(bgcolor=self.accent_color),
+                    ),
+                ],
+            )
+            self.page.dialog = dialog
+            dialog.open = True
+            self.page.update()
+
+        def desfazer_pagamento(lancamento):
+            """Desfaz marcação de pago"""
+            try:
+                lancamento.status_pago = False
+                self.session.commit()
+                self.show_snackbar("↩️ Pagamento revertido.", self.primary_color)
+                self.page.clean()
+                self.build_ui()
+                self.page.update()
+            except Exception as ex:
+                self.show_snackbar(f"❌ Erro: {str(ex)}", self.error_color)
+
+        # ---- Cards de estatísticas ----
+        stats_row = ft.Row(
+            controls=[
+                self.create_stat_card("Total", str(total_lancamentos), "📋", self.primary_color),
+                self.create_stat_card("Pendente", f"R$ {total_pendente:,.2f}", "⏳", self.error_color),
+                self.create_stat_card("Pago", f"R$ {total_pago:,.2f}", "✅", self.accent_color),
+                self.create_stat_card("Vencidos", str(vencidos), "⚠️", "#f59e0b"),
+            ],
+            spacing=15,
+            wrap=True,
+        )
+
+        # ---- Lista de lançamentos ----
+        items = []
+        for lanc in lancamentos:
+            is_pago = lanc.status_pago
+            is_vencido = not is_pago and lanc.data_vencimento < hoje
+
+            # Cor da barra lateral
+            bar_color = self.accent_color if is_pago else (self.error_color if is_vencido else self.primary_color)
+
+            # Badge de status
+            if is_pago:
+                badge_text = "PAGO"
+                badge_bgcolor = "#14532d"
+                badge_color = "#86efac"
+            elif is_vencido:
+                badge_text = f"VENCIDO ({(hoje - lanc.data_vencimento).days}d)"
+                badge_bgcolor = "#450a0a"
+                badge_color = "#fca5a5"
+            else:
+                badge_text = "PENDENTE"
+                badge_bgcolor = "#1e1b4b"
+                badge_color = "#a5b4fc"
+
+            # Botão de ação
+            if is_pago:
+                action_btn = ft.OutlinedButton(
+                    content=ft.Text("↩️ Reverter", size=12),
+                    style=ft.ButtonStyle(color=self.text_secondary),
+                    on_click=lambda e, l=lanc: desfazer_pagamento(l),
+                    height=36,
+                )
+            else:
+                action_btn = ft.FilledButton(
+                    content=ft.Text("✅ Quitar", size=12),
+                    style=ft.ButtonStyle(bgcolor=self.accent_color, color="#fff"),
+                    on_click=lambda e, l=lanc: marcar_pago(l),
+                    height=36,
+                )
+
+            items.append(
+                ft.Container(
+                    content=ft.Row(
+                        controls=[
+                            ft.Container(width=4, height=60, bgcolor=bar_color, border_radius=2),
+                            ft.Column(
+                                controls=[
+                                    ft.Text(
+                                        lanc.proposta.cliente_nome,
+                                        size=14,
+                                        weight=ft.FontWeight.BOLD,
+                                        color=self.text_primary,
+                                    ),
+                                    ft.Text(
+                                        f"📅 Venc: {lanc.data_vencimento.strftime('%d/%m/%Y')}  "
+                                        f"| Seguradora: {lanc.proposta.seguradora.nome}  "
+                                        f"| Corretor: {lanc.proposta.corretor.nome}",
+                                        size=12,
+                                        color=self.text_secondary,
+                                    ),
+                                ],
+                                spacing=3,
+                                expand=True,
+                            ),
+                            ft.Container(
+                                content=ft.Text(
+                                    badge_text,
+                                    size=11,
+                                    weight=ft.FontWeight.BOLD,
+                                    color=badge_color,
+                                ),
+                                bgcolor=badge_bgcolor,
+                                padding=ft.padding.symmetric(horizontal=10, vertical=4),
+                                border_radius=20,
+                            ),
+                            ft.Text(
+                                f"R$ {lanc.valor_esperado:,.2f}",
+                                size=16,
+                                weight=ft.FontWeight.BOLD,
+                                color=self.accent_color if is_pago else self.text_primary,
+                                width=130,
+                                text_align=ft.TextAlign.RIGHT,
+                            ),
+                            action_btn,
+                        ],
+                        spacing=12,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    bgcolor=self.surface_color,
+                    padding=ft.padding.symmetric(horizontal=16, vertical=12),
+                    border_radius=10,
+                    border=ft.Border.all(1, "#334155"),
+                )
+            )
+
+        empty_state = ft.Container(
+            content=ft.Column(
+                controls=[
+                    ft.Text("📋", size=48),
+                    ft.Text("Nenhum lançamento encontrado", size=16, color=self.text_secondary),
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            padding=40,
+            alignment=ft.alignment.center,
+        )
+
         return ft.Container(
             content=ft.Column(
                 controls=[
-                    ft.Text(
-                        "Lançamentos Financeiros",
-                        size=28,
-                        weight=ft.FontWeight.BOLD,
-                        color=self.text_primary,
+                    # Header
+                    ft.Row(
+                        controls=[
+                            ft.Text(
+                                "💳 Lançamentos Financeiros",
+                                size=26,
+                                weight=ft.FontWeight.BOLD,
+                                color=self.text_primary,
+                            ),
+                            ft.Container(expand=True),
+                            ft.FilledButton(
+                                content=ft.Text("🔄 Atualizar", size=13),
+                                style=ft.ButtonStyle(bgcolor=self.primary_color),
+                                on_click=lambda e: (
+                                    self.page.clean(),
+                                    self.build_ui(),
+                                    self.page.update(),
+                                ),
+                                height=40,
+                            ),
+                        ],
                     ),
-                    ft.Text(
-                        "Em desenvolvimento...",
-                        size=16,
-                        color=self.text_secondary,
+                    ft.Divider(height=10, color="#334155"),
+                    # Estatísticas
+                    stats_row,
+                    ft.Divider(height=10, color="#334155"),
+                    # Lista
+                    ft.Column(
+                        controls=items if items else [empty_state],
+                        spacing=8,
+                        scroll=ft.ScrollMode.AUTO,
+                        expand=True,
                     ),
                 ],
+                spacing=15,
+                expand=True,
             ),
-            padding=30,
+            padding=20,
+            expand=True,
         )
 
     def build_repasses_tab(self):
@@ -1345,11 +1556,140 @@ class CorretoraApp:
             )
 
     def ver_detalhes_corretor(self, corretor):
-        """Mostra detalhes completos do corretor"""
-        self.show_snackbar(
-            f"Visualizando detalhes de {corretor.nome}... (em desenvolvimento)",
-            self.primary_color,
+        """Mostra detalhes completos do corretor em um dialog"""
+        from datetime import date
+
+        propostas = corretor.propostas
+        total_bruto = sum(p.valor_bruto for p in propostas)
+        comissao_perc = corretor.comissao_padrao
+        total_comissao = total_bruto * (comissao_perc / 100)
+
+        # Calcular lançamentos
+        total_pago = 0.0
+        total_pendente = 0.0
+        hoje = date.today()
+
+        for p in propostas:
+            for l in p.lancamentos:
+                if l.status_pago:
+                    total_pago += l.valor_esperado
+                else:
+                    total_pendente += l.valor_esperado
+
+        # Linhas de propostas
+        proposta_rows = []
+        for p in propostas:
+            lancamentos_pendentes = sum(1 for l in p.lancamentos if not l.status_pago)
+            proposta_rows.append(
+                ft.Container(
+                    content=ft.Row([
+                        ft.Column([
+                            ft.Text(p.cliente_nome, size=13, weight=ft.FontWeight.BOLD, color=self.text_primary),
+                            ft.Text(
+                                f"Seguradora: {p.seguradora.nome}  |  Venda: {p.data_venda.strftime('%d/%m/%Y')}",
+                                size=11, color=self.text_secondary,
+                            ),
+                        ], spacing=2, expand=True),
+                        ft.Text(f"R$ {p.valor_bruto:,.2f}", size=13, color=self.text_primary),
+                        ft.Container(
+                            content=ft.Text(
+                                f"{lancamentos_pendentes} pend.",
+                                size=11,
+                                color="#fca5a5" if lancamentos_pendentes > 0 else "#86efac",
+                            ),
+                            bgcolor="#450a0a" if lancamentos_pendentes > 0 else "#14532d",
+                            padding=ft.padding.symmetric(horizontal=8, vertical=3),
+                            border_radius=12,
+                        ),
+                    ], spacing=10),
+                    bgcolor="#1e293b",
+                    padding=10,
+                    border_radius=8,
+                    border=ft.Border.all(1, "#334155"),
+                )
+            )
+
+        content = ft.Column(
+            controls=[
+                # Cabeçalho
+                ft.Row([
+                    ft.Column([
+                        ft.Text(corretor.nome, size=20, weight=ft.FontWeight.BOLD, color=self.text_primary),
+                        ft.Text(corretor.email or "Sem e-mail", size=13, color=self.text_secondary),
+                        ft.Text(corretor.telefone or "Sem telefone", size=13, color=self.text_secondary),
+                    ], spacing=3),
+                    ft.Container(expand=True),
+                    ft.Container(
+                        content=ft.Text(
+                            f"{comissao_perc}%",
+                            size=22, weight=ft.FontWeight.BOLD, color=self.primary_color,
+                        ),
+                        bgcolor="#1e1b4b",
+                        padding=ft.padding.symmetric(horizontal=16, vertical=8),
+                        border_radius=12,
+                    ),
+                ]),
+                ft.Divider(color="#334155"),
+                # Resumo financeiro
+                ft.Row([
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("Total Apólices", size=11, color=self.text_secondary),
+                            ft.Text(f"R$ {total_bruto:,.2f}", size=16, weight=ft.FontWeight.BOLD, color=self.text_primary),
+                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                        bgcolor="#1e293b", padding=14, border_radius=8, expand=True,
+                    ),
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("Comissão Total", size=11, color=self.text_secondary),
+                            ft.Text(f"R$ {total_comissao:,.2f}", size=16, weight=ft.FontWeight.BOLD, color=self.primary_color),
+                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                        bgcolor="#1e293b", padding=14, border_radius=8, expand=True,
+                    ),
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("Pago", size=11, color=self.text_secondary),
+                            ft.Text(f"R$ {total_pago:,.2f}", size=16, weight=ft.FontWeight.BOLD, color=self.accent_color),
+                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                        bgcolor="#1e293b", padding=14, border_radius=8, expand=True,
+                    ),
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("Pendente", size=11, color=self.text_secondary),
+                            ft.Text(f"R$ {total_pendente:,.2f}", size=16, weight=ft.FontWeight.BOLD, color=self.error_color),
+                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                        bgcolor="#1e293b", padding=14, border_radius=8, expand=True,
+                    ),
+                ], spacing=10),
+                ft.Divider(color="#334155"),
+                ft.Text(f"Propostas ({len(propostas)})", size=15, weight=ft.FontWeight.BOLD, color=self.text_primary),
+                ft.Column(
+                    controls=proposta_rows if proposta_rows else [
+                        ft.Text("Nenhuma proposta.", color=self.text_secondary, size=13)
+                    ],
+                    spacing=6,
+                    scroll=ft.ScrollMode.AUTO,
+                    height=200,
+                ),
+            ],
+            spacing=12,
+            width=620,
+            tight=True,
         )
+
+        dialog = ft.AlertDialog(
+            title=ft.Text(f"👤 Detalhes - {corretor.nome}"),
+            content=content,
+            actions=[
+                ft.FilledButton(
+                    content=ft.Text("Fechar"),
+                    on_click=lambda e: (setattr(dialog, 'open', False), self.page.update()),
+                ),
+            ],
+        )
+        self.page.dialog = dialog
+        dialog.open = True
+        self.page.update()
 
     def verificar_parcelas_vencidas(self, e):
         """Verifica parcelas vencidas e envia emails"""
@@ -1405,7 +1745,7 @@ class CorretoraApp:
                 lancamento_id=lancamento.id,
                 proposta_id=proposta.id,
                 corretor_id=proposta.corretor_id,
-                valor_total=lancamento.valor_liquido,
+                valor_total=lancamento.valor_esperado,
                 data_primeira_quitacao=data_quitacao
             )
             gerenciador.fechar()
@@ -1746,13 +2086,283 @@ class CorretoraApp:
 
         # ===== SEÇÃO 6: BOTÕES DE AÇÃO =====
         def nova_transacao(e):
-            self.show_snackbar("📝 Nova transação (em desenvolvimento)", self.primary_color)
+            """Abre formulário para nova transação financeira"""
+            from modulo_financeiro import TransacaoFinanceira, CategoriaFinanceira, ContaBancaria
+            from datetime import date as date_type
+
+            categorias = self.session.query(CategoriaFinanceira).all()
+            contas = self.session.query(ContaBancaria).filter_by(ativa=True).all()
+
+            desc_field = ft.TextField(label="Descrição", width=380)
+            tipo_dropdown = ft.Dropdown(
+                label="Tipo",
+                width=160,
+                options=[
+                    ft.dropdown.Option("RECEITA", "📈 Receita"),
+                    ft.dropdown.Option("DESPESA", "📉 Despesa"),
+                ],
+                value="RECEITA",
+            )
+            valor_field = ft.TextField(
+                label="Valor (R$)", width=160, keyboard_type=ft.KeyboardType.NUMBER
+            )
+            data_field = ft.TextField(
+                label="Data (DD/MM/AAAA)",
+                value=date_type.today().strftime("%d/%m/%Y"),
+                width=180,
+            )
+            venc_field = ft.TextField(
+                label="Vencimento (opcional)",
+                hint_text="DD/MM/AAAA",
+                width=180,
+            )
+            obs_field = ft.TextField(label="Observações", multiline=True, max_lines=2, width=380)
+
+            categoria_dropdown = ft.Dropdown(
+                label="Categoria",
+                width=200,
+                options=[ft.dropdown.Option(str(c.id), c.nome) for c in categorias],
+            )
+            conta_dropdown = ft.Dropdown(
+                label="Conta",
+                width=200,
+                options=[ft.dropdown.Option(str(c.id), c.nome) for c in contas],
+            )
+
+            def salvar(e):
+                try:
+                    if not desc_field.value or not valor_field.value:
+                        self.show_snackbar("❌ Preencha descrição e valor!", self.error_color)
+                        return
+
+                    from datetime import datetime as dt
+                    data_obj = dt.strptime(data_field.value, "%d/%m/%Y").date()
+                    venc_obj = None
+                    if venc_field.value:
+                        venc_obj = dt.strptime(venc_field.value, "%d/%m/%Y").date()
+
+                    transacao = TransacaoFinanceira(
+                        descricao=desc_field.value,
+                        tipo=tipo_dropdown.value,
+                        valor=float(valor_field.value.replace(",", ".")),
+                        data_transacao=data_obj,
+                        data_vencimento=venc_obj,
+                        status="PENDENTE",
+                        categoria_id=int(categoria_dropdown.value) if categoria_dropdown.value else None,
+                        conta_id=int(conta_dropdown.value) if conta_dropdown.value else None,
+                        observacoes=obs_field.value or None,
+                    )
+                    self.session.add(transacao)
+                    self.session.commit()
+                    self.show_snackbar("✅ Transação registrada!", self.accent_color)
+                    dialog.open = False
+                    self.page.update()
+                    self.page.clean()
+                    self.build_ui()
+                    self.page.update()
+                except Exception as ex:
+                    self.show_snackbar(f"❌ Erro: {str(ex)}", self.error_color)
+
+            dialog = ft.AlertDialog(
+                title=ft.Text("➕ Nova Transação Financeira"),
+                content=ft.Column(
+                    controls=[
+                        ft.Row([tipo_dropdown, valor_field], spacing=10),
+                        desc_field,
+                        ft.Row([data_field, venc_field], spacing=10),
+                        ft.Row([categoria_dropdown, conta_dropdown], spacing=10),
+                        obs_field,
+                    ],
+                    tight=True,
+                    spacing=10,
+                    width=420,
+                ),
+                actions=[
+                    ft.TextButton(
+                        content=ft.Text("Cancelar"),
+                        on_click=lambda e: (setattr(dialog, 'open', False), self.page.update()),
+                    ),
+                    ft.FilledButton(
+                        content=ft.Text("✅ Salvar"),
+                        on_click=salvar,
+                        style=ft.ButtonStyle(bgcolor=self.accent_color),
+                    ),
+                ],
+            )
+            self.page.dialog = dialog
+            dialog.open = True
+            self.page.update()
 
         def gerenciar_categorias(e):
-            self.show_snackbar("🏷️ Gerenciar categorias (em desenvolvimento)", self.primary_color)
+            """Abre dialog para gerenciar categorias financeiras"""
+            from modulo_financeiro import CategoriaFinanceira
+
+            categorias = self.session.query(CategoriaFinanceira).all()
+
+            nome_field = ft.TextField(label="Nome da Categoria", width=220)
+            tipo_cat = ft.Dropdown(
+                label="Tipo",
+                width=140,
+                options=[
+                    ft.dropdown.Option("RECEITA", "📈 Receita"),
+                    ft.dropdown.Option("DESPESA", "📉 Despesa"),
+                ],
+                value="RECEITA",
+            )
+
+            lista_ref = ft.Column(spacing=5, scroll=ft.ScrollMode.AUTO, height=200)
+
+            def refresh_lista():
+                cats = self.session.query(CategoriaFinanceira).all()
+                lista_ref.controls.clear()
+                for cat in cats:
+                    def del_cat(e, c=cat):
+                        self.session.delete(c)
+                        self.session.commit()
+                        refresh_lista()
+                        self.page.update()
+
+                    lista_ref.controls.append(
+                        ft.Row([
+                            ft.Container(
+                                content=ft.Text(
+                                    "R" if cat.tipo == "RECEITA" else "D",
+                                    size=11, color="#86efac" if cat.tipo == "RECEITA" else "#fca5a5",
+                                ),
+                                bgcolor="#14532d" if cat.tipo == "RECEITA" else "#450a0a",
+                                padding=ft.padding.symmetric(horizontal=8, vertical=2),
+                                border_radius=10,
+                            ),
+                            ft.Text(cat.nome, size=13, color=self.text_primary, expand=True),
+                            ft.IconButton(
+                                icon=ft.icons.DELETE_OUTLINE,
+                                icon_color=self.error_color,
+                                icon_size=18,
+                                on_click=del_cat,
+                            ),
+                        ], spacing=8)
+                    )
+                self.page.update()
+
+            def adicionar_cat(e):
+                if not nome_field.value:
+                    return
+                nova = CategoriaFinanceira(nome=nome_field.value, tipo=tipo_cat.value)
+                self.session.add(nova)
+                self.session.commit()
+                nome_field.value = ""
+                refresh_lista()
+                self.page.update()
+
+            refresh_lista()
+
+            dialog = ft.AlertDialog(
+                title=ft.Text("🏷️ Gerenciar Categorias"),
+                content=ft.Column([
+                    ft.Row([nome_field, tipo_cat], spacing=8),
+                    ft.FilledButton(
+                        content=ft.Text("➕ Adicionar"),
+                        style=ft.ButtonStyle(bgcolor=self.primary_color),
+                        on_click=adicionar_cat,
+                    ),
+                    ft.Divider(color="#334155"),
+                    lista_ref,
+                ], tight=True, spacing=10, width=400),
+                actions=[
+                    ft.FilledButton(
+                        content=ft.Text("Fechar"),
+                        on_click=lambda e: (setattr(dialog, 'open', False), self.page.update()),
+                    ),
+                ],
+            )
+            self.page.dialog = dialog
+            dialog.open = True
+            self.page.update()
 
         def criar_meta(e):
-            self.show_snackbar("🎯 Criar meta (em desenvolvimento)", self.primary_color)
+            """Abre formulário para criar meta financeira"""
+            from modulo_financeiro import Meta
+            from datetime import datetime as dt
+
+            nome_field = ft.TextField(label="Nome da Meta", width=300)
+            tipo_dropdown = ft.Dropdown(
+                label="Tipo",
+                width=150,
+                options=[
+                    ft.dropdown.Option("RECEITA", "📈 Receita"),
+                    ft.dropdown.Option("DESPESA", "📉 Despesa"),
+                    ft.dropdown.Option("LUCRO", "💰 Lucro"),
+                ],
+                value="RECEITA",
+            )
+            valor_field = ft.TextField(
+                label="Valor Meta (R$)", width=160, keyboard_type=ft.KeyboardType.NUMBER
+            )
+            periodo_dropdown = ft.Dropdown(
+                label="Período",
+                width=150,
+                options=[
+                    ft.dropdown.Option("MENSAL", "Mensal"),
+                    ft.dropdown.Option("TRIMESTRAL", "Trimestral"),
+                    ft.dropdown.Option("ANUAL", "Anual"),
+                ],
+                value="MENSAL",
+            )
+            ano_field = ft.TextField(
+                label="Ano", value=str(dt.now().year), width=100, keyboard_type=ft.KeyboardType.NUMBER
+            )
+            mes_field = ft.TextField(
+                label="Mês (1-12)", value=str(dt.now().month), width=100, keyboard_type=ft.KeyboardType.NUMBER
+            )
+
+            def salvar_meta(e):
+                try:
+                    if not nome_field.value or not valor_field.value:
+                        self.show_snackbar("❌ Preencha nome e valor!", self.error_color)
+                        return
+
+                    meta = Meta(
+                        nome=nome_field.value,
+                        tipo=tipo_dropdown.value,
+                        valor_meta=float(valor_field.value.replace(",", ".")),
+                        periodo=periodo_dropdown.value,
+                        mes=int(mes_field.value) if mes_field.value else None,
+                        ano=int(ano_field.value),
+                        ativa=True,
+                    )
+                    self.session.add(meta)
+                    self.session.commit()
+                    self.show_snackbar("✅ Meta criada com sucesso!", self.accent_color)
+                    dialog.open = False
+                    self.page.update()
+                    self.page.clean()
+                    self.build_ui()
+                    self.page.update()
+                except Exception as ex:
+                    self.show_snackbar(f"❌ Erro: {str(ex)}", self.error_color)
+
+            dialog = ft.AlertDialog(
+                title=ft.Text("🎯 Criar Nova Meta Financeira"),
+                content=ft.Column([
+                    nome_field,
+                    ft.Row([tipo_dropdown, valor_field], spacing=10),
+                    ft.Row([periodo_dropdown, ano_field, mes_field], spacing=10),
+                ], tight=True, spacing=10, width=380),
+                actions=[
+                    ft.TextButton(
+                        content=ft.Text("Cancelar"),
+                        on_click=lambda e: (setattr(dialog, 'open', False), self.page.update()),
+                    ),
+                    ft.FilledButton(
+                        content=ft.Text("✅ Criar Meta"),
+                        on_click=salvar_meta,
+                        style=ft.ButtonStyle(bgcolor=self.accent_color),
+                    ),
+                ],
+            )
+            self.page.dialog = dialog
+            dialog.open = True
+            self.page.update()
 
         acoes_section = ft.Row([
             ft.FilledButton(
@@ -2079,37 +2689,123 @@ class CorretoraApp:
         config = ConfigManager(session=self.session)
         impostos = config.listar_impostos()
 
+        def editar_imposto(nome_imposto, valor_atual):
+            """Abre dialog para editar alíquota"""
+            valor_field = ft.TextField(
+                label=f"Nova alíquota para {nome_imposto} (%)",
+                value=str(valor_atual),
+                width=260,
+                keyboard_type=ft.KeyboardType.NUMBER,
+            )
+
+            def salvar(e):
+                try:
+                    novo_valor = float(valor_field.value.replace(",", "."))
+                    if novo_valor < 0 or novo_valor > 100:
+                        self.show_snackbar("❌ Valor deve ser entre 0 e 100!", self.error_color)
+                        return
+                    config.set_imposto(nome_imposto, novo_valor)
+                    self.show_snackbar(f"✅ {nome_imposto} atualizado para {novo_valor}%", self.accent_color)
+                    dialog.open = False
+                    self.page.update()
+                    self.page.clean()
+                    self.build_ui()
+                    self.page.update()
+                except ValueError:
+                    self.show_snackbar("❌ Valor inválido!", self.error_color)
+
+            dialog = ft.AlertDialog(
+                title=ft.Text(f"✏️ Editar {nome_imposto}"),
+                content=ft.Column([
+                    ft.Text(f"Alíquota atual: {valor_atual}%", size=14, color=self.text_secondary),
+                    valor_field,
+                ], tight=True, spacing=10),
+                actions=[
+                    ft.TextButton(
+                        content=ft.Text("Cancelar"),
+                        on_click=lambda e: (setattr(dialog, 'open', False), self.page.update()),
+                    ),
+                    ft.FilledButton(
+                        content=ft.Text("✅ Salvar"),
+                        on_click=salvar,
+                        style=ft.ButtonStyle(bgcolor=self.accent_color),
+                    ),
+                ],
+            )
+            self.page.dialog = dialog
+            dialog.open = True
+            self.page.update()
+
         impostos_list = ft.Column(
             controls=[
-                ft.ListTile(
-                    leading=ft.Text("%", size=24, color=self.primary_color),
-                    title=ft.Text(f"{nome}", color=self.text_primary),
-                    subtitle=ft.Text(f"Alíquota: {valor}%", color=self.text_secondary),
-                    trailing=ft.TextButton(
-                        content=ft.Text("✏️"),
-                        tooltip="Editar",
-                    ),
+                ft.Container(
+                    content=ft.Row([
+                        ft.Container(
+                            content=ft.Text("%", size=18, color=self.primary_color),
+                            bgcolor="#1e1b4b",
+                            padding=10,
+                            border_radius=8,
+                            width=44,
+                            alignment=ft.alignment.center,
+                        ),
+                        ft.Column([
+                            ft.Text(nome, size=15, weight=ft.FontWeight.BOLD, color=self.text_primary),
+                            ft.Text(f"Alíquota: {valor}%", size=13, color=self.text_secondary),
+                        ], spacing=2, expand=True),
+                        ft.FilledButton(
+                            content=ft.Text("✏️ Editar", size=13),
+                            style=ft.ButtonStyle(bgcolor=self.primary_color),
+                            on_click=lambda e, n=nome, v=valor: editar_imposto(n, v),
+                            height=38,
+                        ),
+                    ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    bgcolor=self.surface_color,
+                    padding=ft.padding.symmetric(horizontal=16, vertical=12),
+                    border_radius=10,
+                    border=ft.Border.all(1, "#334155"),
                 )
                 for nome, valor in impostos.items()
             ],
-            spacing=5,
+            spacing=8,
         )
+
+        total_impostos = sum(impostos.values())
 
         return ft.Container(
             content=ft.Column(
                 controls=[
+                    ft.Row([
+                        ft.Text(
+                            "⚙️ Configurações de Impostos",
+                            size=26,
+                            weight=ft.FontWeight.BOLD,
+                            color=self.text_primary,
+                        ),
+                        ft.Container(expand=True),
+                        ft.Container(
+                            content=ft.Column([
+                                ft.Text("Total de Impostos", size=11, color=self.text_secondary),
+                                ft.Text(f"{total_impostos:.2f}%", size=20, weight=ft.FontWeight.BOLD, color=self.error_color),
+                            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                            bgcolor=self.surface_color,
+                            padding=ft.padding.symmetric(horizontal=20, vertical=10),
+                            border_radius=10,
+                            border=ft.Border.all(1, "#334155"),
+                        ),
+                    ]),
                     ft.Text(
-                        "Configurações de Impostos",
-                        size=28,
-                        weight=ft.FontWeight.BOLD,
-                        color=self.text_primary,
+                        "Clique em ✏️ Editar para alterar a alíquota de cada imposto.",
+                        size=13,
+                        color=self.text_secondary,
+                        italic=True,
                     ),
                     ft.Divider(height=20, color="#334155"),
                     impostos_list,
                 ],
                 scroll=ft.ScrollMode.AUTO,
+                spacing=12,
             ),
-            padding=30,
+            padding=25,
         )
 
     def importar_pdf(self, e):
