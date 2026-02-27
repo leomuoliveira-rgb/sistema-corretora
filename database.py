@@ -145,7 +145,12 @@ class Proposta(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     cliente_nome = Column(String(200), nullable=False)
-    cliente_cpf = Column(String(20), nullable=True)  # CPF/CNPJ do cliente
+    cliente_cpf = Column(String(20), nullable=True)
+    cliente_rg = Column(String(30), nullable=True)
+    cliente_data_nascimento = Column(Date, nullable=True)
+    cliente_telefone = Column(String(50), nullable=True)
+    cliente_email = Column(String(200), nullable=True)
+    tipo_plano = Column(String(200), nullable=True)
     valor_bruto = Column(Float, nullable=False)
     seguradora_id = Column(Integer, ForeignKey('seguradoras.id'), nullable=False)
     corretor_id = Column(Integer, ForeignKey('corretores.id'), nullable=False)
@@ -155,9 +160,33 @@ class Proposta(Base):
     seguradora = relationship('Seguradora', back_populates='propostas')
     corretor = relationship('Corretor', back_populates='propostas')
     lancamentos = relationship('Lancamento', back_populates='proposta', cascade='all, delete-orphan')
+    dependentes = relationship('Dependente', back_populates='proposta', cascade='all, delete-orphan')
 
     def __repr__(self):
         return f"<Proposta(cliente='{self.cliente_nome}', valor={self.valor_bruto})>"
+
+
+class Dependente(Base):
+    """Dependentes vinculados a uma proposta"""
+    __tablename__ = 'dependentes'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    proposta_id = Column(Integer, ForeignKey('propostas.id'), nullable=False)
+    nome = Column(String(200), nullable=False)
+    cpf = Column(String(20), nullable=True)
+    rg = Column(String(30), nullable=True)
+    data_nascimento = Column(Date, nullable=True)
+    parentesco = Column(String(50), nullable=True)  # Cônjuge, Filho(a), etc.
+    sexo = Column(String(20), nullable=True)         # Masculino, Feminino
+    estado_civil = Column(String(50), nullable=True) # Solteiro, Casado, etc.
+    telefone = Column(String(50), nullable=True)
+    email = Column(String(200), nullable=True)
+
+    # Relacionamento
+    proposta = relationship('Proposta', back_populates='dependentes')
+
+    def __repr__(self):
+        return f"<Dependente(nome='{self.nome}', proposta_id={self.proposta_id})>"
 
 
 class Lancamento(Base):
@@ -242,6 +271,39 @@ def aplicar_migracoes(engine):
         if 'cliente_cpf' not in colunas_propostas:
             cursor.execute("ALTER TABLE propostas ADD COLUMN cliente_cpf VARCHAR(20)")
             print("[MIGRAÇÃO] Coluna 'cliente_cpf' adicionada à tabela propostas")
+
+        # Novas colunas de dados cadastrais do cliente
+        if 'cliente_rg' not in colunas_propostas:
+            cursor.execute("ALTER TABLE propostas ADD COLUMN cliente_rg VARCHAR(30)")
+            print("[MIGRAÇÃO] Coluna 'cliente_rg' adicionada à tabela propostas")
+
+        if 'cliente_data_nascimento' not in colunas_propostas:
+            cursor.execute("ALTER TABLE propostas ADD COLUMN cliente_data_nascimento DATE")
+            print("[MIGRAÇÃO] Coluna 'cliente_data_nascimento' adicionada à tabela propostas")
+
+        if 'cliente_telefone' not in colunas_propostas:
+            cursor.execute("ALTER TABLE propostas ADD COLUMN cliente_telefone VARCHAR(50)")
+            print("[MIGRAÇÃO] Coluna 'cliente_telefone' adicionada à tabela propostas")
+
+        if 'cliente_email' not in colunas_propostas:
+            cursor.execute("ALTER TABLE propostas ADD COLUMN cliente_email VARCHAR(200)")
+            print("[MIGRAÇÃO] Coluna 'cliente_email' adicionada à tabela propostas")
+
+        if 'tipo_plano' not in colunas_propostas:
+            cursor.execute("ALTER TABLE propostas ADD COLUMN tipo_plano VARCHAR(200)")
+            print("[MIGRAÇÃO] Coluna 'tipo_plano' adicionada à tabela propostas")
+
+        # Verificar colunas em dependentes
+        cursor.execute("PRAGMA table_info(dependentes)")
+        colunas_dep = [col[1] for col in cursor.fetchall()]
+
+        if 'sexo' not in colunas_dep:
+            cursor.execute("ALTER TABLE dependentes ADD COLUMN sexo VARCHAR(20)")
+            print("[MIGRAÇÃO] Coluna 'sexo' adicionada à tabela dependentes")
+
+        if 'estado_civil' not in colunas_dep:
+            cursor.execute("ALTER TABLE dependentes ADD COLUMN estado_civil VARCHAR(50)")
+            print("[MIGRAÇÃO] Coluna 'estado_civil' adicionada à tabela dependentes")
 
         conn.commit()
         conn.close()
