@@ -96,8 +96,8 @@ print("Iniciando interface...\n")
 import main
 import flet as ft
 
-ft.app(
-    target=main.main,
+ft.run(
+    main.main,
     view=ft.AppView.WEB_BROWSER,
     host="0.0.0.0",
     port=8550,
