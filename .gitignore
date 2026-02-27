@@ -1,0 +1,50 @@
+# Banco de dados
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Ambiente virtual
+venv/
+env/
+.venv/
+Lib/
+Scripts/
+Include/
+pyvenv.cfg
+
+# Flet
+.flet/
+assets/
+
+# IDEs
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+nul
+
+# Logs e temporários
+*.log
+*.tmp
+*.bak
+
+# Uploads e exports
+uploads/
+exports/
+*.pdf
