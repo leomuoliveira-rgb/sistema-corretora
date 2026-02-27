@@ -2354,6 +2354,22 @@ class CorretoraApp:
         contas_receber = controle.obter_contas_receber()
         contas_receber_vencidas = controle.obter_contas_receber(vencidas=True)
 
+        def marcar_recebido(e, tx_id):
+            from modulo_financeiro import TransacaoFinanceira
+            from datetime import date as date_type
+            try:
+                tx = self.session.query(TransacaoFinanceira).get(tx_id)
+                if tx:
+                    tx.status = 'PAGO'
+                    tx.data_pagamento = date_type.today()
+                    self.session.commit()
+                self.show_snackbar("✅ Recebimento registrado!", self.accent_color)
+                self.page.clean()
+                self.build_ui()
+                self.page.update()
+            except Exception as ex:
+                self.show_snackbar(f"❌ Erro: {str(ex)}", self.error_color)
+
         receber_items = []
         for conta in contas_receber[:10]:  # Mostrar últimas 10
             is_vencida = conta.data_vencimento and conta.data_vencimento < hoje.date()
@@ -2373,9 +2389,13 @@ class CorretoraApp:
                                 size=12,
                                 color=self.error_color if is_vencida else self.text_secondary
                             ),
-                        ], spacing=2),
-                        ft.Container(expand=True),
+                        ], spacing=2, expand=True),
                         ft.Text(f"R$ {conta.valor:,.2f}", size=16, weight=ft.FontWeight.BOLD, color=self.accent_color),
+                        ft.FilledButton(
+                            content=ft.Text("✓ Recebido", size=12),
+                            style=ft.ButtonStyle(bgcolor=self.accent_color),
+                            on_click=lambda e, tid=conta.id: marcar_recebido(e, tid),
+                        ),
                     ], spacing=10),
                     bgcolor=self.surface_color,
                     padding=15,
