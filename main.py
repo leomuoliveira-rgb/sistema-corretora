@@ -5,11 +5,121 @@ Interface moderna em Dark Mode usando Flet
 
 import flet as ft
 import os
+import json
+import threading
 from datetime import datetime, timedelta
 from database import criar_banco, obter_sessao, Lancamento, Proposta, Corretor
 from sqlalchemy import and_
 from finance_engine import FinanceEngine
 from config_manager import ConfigManager
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Configuração dos provedores de IA disponíveis
+AI_PROVIDERS = {
+    "Claude (Anthropic)": {
+        "key_file": ".anthropic_key",
+        "env_var": "ANTHROPIC_API_KEY",
+        "hint": "sk-ant-...",
+        "modelo": "claude-sonnet-4-6",
+        "cor": "#6366f1",
+    },
+    "ChatGPT (OpenAI)": {
+        "key_file": ".openai_key",
+        "env_var": "OPENAI_API_KEY",
+        "hint": "sk-...",
+        "modelo": "gpt-4o-mini",
+        "cor": "#10b981",
+    },
+    "Gemini (Google)": {
+        "key_file": ".gemini_key",
+        "env_var": "GEMINI_API_KEY",
+        "hint": "AIza...",
+        "modelo": "gemini-1.5-flash",
+        "cor": "#f59e0b",
+    },
+    "Llama (Groq)": {
+        "key_file": ".groq_key",
+        "env_var": "GROQ_API_KEY",
+        "hint": "gsk_...",
+        "modelo": "llama-3.3-70b-versatile",
+        "cor": "#ef4444",
+    },
+}
+
+
+def _load_ai_key(provider: str) -> str:
+    """Carrega a chave de API de um provedor."""
+    cfg = AI_PROVIDERS.get(provider, {})
+    env = cfg.get("env_var", "")
+    if env and os.environ.get(env):
+        return os.environ[env]
+    key_file = os.path.join(_BASE_DIR, cfg.get("key_file", ""))
+    if os.path.exists(key_file):
+        with open(key_file, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    return ""
+
+
+def _save_ai_key(provider: str, key: str):
+    """Salva a chave de API de um provedor."""
+    cfg = AI_PROVIDERS.get(provider, {})
+    key_file = os.path.join(_BASE_DIR, cfg.get("key_file", ".unknown_key"))
+    with open(key_file, "w", encoding="utf-8") as f:
+        f.write(key.strip())
+
+
+def _chamar_ia(provider: str, api_key: str, system_prompt: str, historico: list) -> str:
+    """Chama a API do provedor selecionado e retorna a resposta como string."""
+    modelo = AI_PROVIDERS[provider]["modelo"]
+
+    if provider == "Claude (Anthropic)":
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        resp = client.messages.create(
+            model=modelo, max_tokens=1024,
+            system=system_prompt, messages=historico[-20:],
+        )
+        return resp.content[0].text
+
+    elif provider == "ChatGPT (OpenAI)":
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        msgs = [{"role": "system", "content": system_prompt}] + historico[-20:]
+        resp = client.chat.completions.create(model=modelo, messages=msgs, max_tokens=1024)
+        return resp.choices[0].message.content
+
+    elif provider == "Gemini (Google)":
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(modelo, system_instruction=system_prompt)
+        # Converte histórico para formato Gemini
+        gemini_hist = []
+        for m in historico[-20:-1]:
+            role = "user" if m["role"] == "user" else "model"
+            gemini_hist.append({"role": role, "parts": [m["content"]]})
+        chat = model.start_chat(history=gemini_hist)
+        last_msg = historico[-1]["content"] if historico else ""
+        resp = chat.send_message(last_msg)
+        return resp.text
+
+    elif provider == "Llama (Groq)":
+        from groq import Groq
+        client = Groq(api_key=api_key)
+        msgs = [{"role": "system", "content": system_prompt}] + historico[-20:]
+        resp = client.chat.completions.create(model=modelo, messages=msgs, max_tokens=1024)
+        return resp.choices[0].message.content
+
+    return "Provedor não suportado."
+
+
+# Compatibilidade com código legado
+def _load_api_key() -> str:
+    return _load_ai_key("Claude (Anthropic)")
+
+
+def _save_api_key(key: str):
+    _save_ai_key("Claude (Anthropic)", key)
 
 
 class CorretoraApp:
@@ -44,6 +154,11 @@ class CorretoraApp:
         self.file_picker_com = ft.FilePicker()      # para comissões
         self.page.services.append(self.file_picker)
         self.page.services.append(self.file_picker_com)
+
+        # Estado do chatbot IA
+        self._chat_history: list[dict] = []          # mensagens do chat atual
+        self._chat_messages_col: ft.Column | None = None  # referência à coluna de mensagens
+        self._chat_input: ft.TextField | None = None      # referência ao campo de entrada
 
         # Construir interface
         self.build_ui()
@@ -119,8 +234,34 @@ class CorretoraApp:
         )
 
     def build_tabs(self):
-        """Constrói as abas principais"""
-        # Criar TabBar com os títulos das tabs
+        """Constrói as abas com lazy loading — cada aba é construída só quando acessada."""
+
+        self._tab_builders = [
+            self.build_dashboard,
+            self.build_crm_tab,
+            self.build_propostas_tab,
+            self.build_lancamentos_tab,
+            self.build_repasses_tab,
+            self.build_financeiro_tab,
+            self.build_corretores_tab,
+            self.build_config_tab,
+            self.build_assistente_tab,
+            self.build_agente_tab,
+        ]
+
+        def _make_placeholder():
+            return ft.Container(
+                content=ft.Column([
+                    ft.ProgressRing(width=32, height=32, stroke_width=3, color=self.primary_color),
+                    ft.Text("Carregando...", color=self.text_secondary, size=14),
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                   alignment=ft.MainAxisAlignment.CENTER, expand=True),
+                expand=True,
+            )
+
+        self._tab_placeholders = [_make_placeholder() for _ in self._tab_builders]
+        self._tab_construida   = [False] * len(self._tab_builders)
+
         tab_bar = ft.TabBar(
             tabs=[
                 ft.Tab(label="📊 Dashboard"),
@@ -131,33 +272,70 @@ class CorretoraApp:
                 ft.Tab(label="💰 Financeiro"),
                 ft.Tab(label="👥 Corretores"),
                 ft.Tab(label="⚙️ Configurações"),
+                ft.Tab(label="🤖 Assistente IA"),
+                ft.Tab(label="⚡ Agente IA"),
             ],
         )
 
-        # Criar TabBarView com o conteúdo de cada tab
-        tab_view = ft.TabBarView(
-            controls=[
-                self.build_dashboard(),
-                self.build_crm_tab(),
-                self.build_propostas_tab(),
-                self.build_lancamentos_tab(),
-                self.build_repasses_tab(),
-                self.build_financeiro_tab(),
-                self.build_corretores_tab(),
-                self.build_config_tab(),
-            ],
-            expand=True,
-        )
+        tab_view = ft.TabBarView(controls=self._tab_placeholders, expand=True)
 
-        # Combinar em um Tabs component
+        def _on_tab_change(e):
+            idx = tab_bar.selected_index or 0
+            if not self._tab_construida[idx]:
+                self._tab_construida[idx] = True
+                threading.Thread(target=lambda i=idx: self._build_tab_async(i), daemon=True).start()
+
+        tab_bar.on_change = _on_tab_change
+
+        # Dashboard construído em background — janela abre instantaneamente
+        self._tab_construida[0] = True
+        threading.Thread(target=lambda: self._build_tab_async(0), daemon=True).start()
+
         tabs = ft.Tabs(
             content=ft.Column([tab_bar, tab_view], expand=True, spacing=0),
-            length=8,
+            length=10,
             selected_index=0,
             animation_duration=300,
         )
 
         return ft.Container(content=tabs, expand=True, padding=0)
+
+    def _build_tab_async(self, idx: int):
+        """Constrói uma aba em thread separada e atualiza a UI."""
+        try:
+            content = self._tab_builders[idx]()
+        except Exception as ex:
+            content = ft.Text(f"Erro ao carregar aba: {ex}", color=self.error_color)
+        self._tab_placeholders[idx].content = content
+        self._tab_construida[idx] = True
+        try:
+            self._tab_placeholders[idx].update()
+        except Exception:
+            pass
+
+    def _refresh_tab(self, idx: int):
+        """Reconstrói apenas uma aba específica — sem rebuildar o app inteiro."""
+        if not hasattr(self, '_tab_placeholders'):
+            return
+        # Mostra spinner enquanto reconstrói
+        self._tab_placeholders[idx].content = ft.Column([
+            ft.ProgressRing(width=32, height=32, stroke_width=3, color=self.primary_color),
+            ft.Text("Atualizando...", color=self.text_secondary, size=14),
+        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+           alignment=ft.MainAxisAlignment.CENTER, expand=True)
+        try:
+            self._tab_placeholders[idx].update()
+        except Exception:
+            pass
+        threading.Thread(target=lambda: self._build_tab_async(idx), daemon=True).start()
+
+    def _voltar_ao_app(self, refresh_tab: int = -1):
+        """Retorna para o app principal a partir de uma sub-tela, sem rebuildar tudo."""
+        self.page.clean()
+        self.page.add(self.main_container)
+        self.page.update()
+        if refresh_tab >= 0:
+            self._refresh_tab(refresh_tab)
 
     def build_dashboard(self):
         """Constrói o dashboard com gráficos"""
@@ -454,48 +632,34 @@ class CorretoraApp:
         )
 
     def calcular_previsoes(self):
-        """Calcula previsões de recebimento"""
+        """Calcula previsões de recebimento — query única com agregação SQL."""
+        from sqlalchemy import func, case
         hoje = datetime.now().date()
-
-        # 3 meses
-        data_3m = hoje + timedelta(days=90)
-        valor_3m = self.session.query(Lancamento).filter(
-            and_(
-                Lancamento.status_pago == False,
-                Lancamento.data_vencimento <= data_3m,
-            )
-        ).all()
-        total_3m = sum(l.valor_esperado for l in valor_3m)
-
-        # 6 meses
-        data_6m = hoje + timedelta(days=180)
-        valor_6m = self.session.query(Lancamento).filter(
-            and_(
-                Lancamento.status_pago == False,
-                Lancamento.data_vencimento <= data_6m,
-            )
-        ).all()
-        total_6m = sum(l.valor_esperado for l in valor_6m)
-
-        # 12 meses
+        data_3m  = hoje + timedelta(days=90)
+        data_6m  = hoje + timedelta(days=180)
         data_12m = hoje + timedelta(days=365)
-        valor_12m = self.session.query(Lancamento).filter(
-            and_(
-                Lancamento.status_pago == False,
-                Lancamento.data_vencimento <= data_12m,
-            )
-        ).all()
-        total_12m = sum(l.valor_esperado for l in valor_12m)
 
-        # Total pendente
-        total_pendente = self.session.query(Lancamento).filter_by(status_pago=False).all()
-        total_pend = sum(l.valor_esperado for l in total_pendente)
+        row = self.session.query(
+            func.sum(case(
+                (Lancamento.data_vencimento <= data_3m,  Lancamento.valor_esperado),
+                else_=0,
+            )).label("t3m"),
+            func.sum(case(
+                (Lancamento.data_vencimento <= data_6m,  Lancamento.valor_esperado),
+                else_=0,
+            )).label("t6m"),
+            func.sum(case(
+                (Lancamento.data_vencimento <= data_12m, Lancamento.valor_esperado),
+                else_=0,
+            )).label("t12m"),
+            func.sum(Lancamento.valor_esperado).label("tpend"),
+        ).filter(Lancamento.status_pago == False).one()
 
         return {
-            '3_meses': total_3m,
-            '6_meses': total_6m,
-            '12_meses': total_12m,
-            'total_pendente': total_pend,
+            '3_meses':        float(row.t3m  or 0),
+            '6_meses':        float(row.t6m  or 0),
+            '12_meses':       float(row.t12m or 0),
+            'total_pendente': float(row.tpend or 0),
         }
 
     def build_crm_tab(self):
@@ -523,9 +687,7 @@ class CorretoraApp:
             return STATUS_COLORS.get(status, '#6b7280')
 
         def _reload():
-            self.page.clean()
-            self.build_ui()
-            self.page.update()
+            self._refresh_tab(1)
 
         def _fechar(dlg):
             dlg.open = False
@@ -538,7 +700,7 @@ class CorretoraApp:
             COR = self.primary_color
 
             def _voltar_crm():
-                self.page.clean(); self.build_ui(); self.page.update()
+                self._voltar_ao_app(refresh_tab=1)
 
             # Corretor pré-selecionado (se usuario logado for corretor)
             corretor_pre = None
@@ -1026,22 +1188,43 @@ class CorretoraApp:
             else todos_leads
         )
 
+        # Pré-carregar follow-ups em uma única query (elimina N+1)
+        _lead_ids_exib = [l.id for l in filtrado[:60]]
+        followup_map: dict = {}
+        if _lead_ids_exib:
+            from sqlalchemy import func as _func
+            _subq = (
+                self.session.query(
+                    Interacao.lead_id,
+                    _func.max(Interacao.data_hora).label("max_dt"),
+                )
+                .filter(Interacao.lead_id.in_(_lead_ids_exib))
+                .group_by(Interacao.lead_id)
+                .subquery()
+            )
+            _inter_rows = (
+                self.session.query(Interacao)
+                .join(
+                    _subq,
+                    (Interacao.lead_id == _subq.c.lead_id)
+                    & (Interacao.data_hora == _subq.c.max_dt),
+                )
+                .filter(Interacao.proximo_followup.isnot(None))
+                .all()
+            )
+            from datetime import date as _date_cls
+            _hoje_d = _date_cls.today()
+            for _r in _inter_rows:
+                if _r.proximo_followup.date() <= _hoje_d:
+                    followup_map[_r.lead_id] = _r.proximo_followup
+
         leads_list = []
         for lead in filtrado[:60]:
             status_color = _cor(lead.status)
 
-            # Follow-up vencido?
-            followup_alert = ""
-            ult_inter = (
-                self.session.query(Interacao)
-                .filter(Interacao.lead_id == lead.id)
-                .order_by(Interacao.data_hora.desc())
-                .first()
-            )
-            if ult_inter and ult_inter.proximo_followup:
-                from datetime import date
-                if ult_inter.proximo_followup.date() <= date.today():
-                    followup_alert = f"⚠️ Follow-up: {ult_inter.proximo_followup.strftime('%d/%m/%Y')}"
+            # Follow-up vencido? (usa mapa pré-carregado — sem query adicional)
+            _fp = followup_map.get(lead.id)
+            followup_alert = f"⚠️ Follow-up: {_fp.strftime('%d/%m/%Y')}" if _fp else ""
 
             leads_list.append(
                 ft.Container(
@@ -1177,8 +1360,18 @@ class CorretoraApp:
         """Constrói a aba de propostas"""
         from database import Proposta, Corretor, Seguradora
 
-        # Buscar todas as propostas
-        propostas = self.session.query(Proposta).order_by(Proposta.data_venda.desc()).all()
+        # Buscar propostas — joinedload evita N+1 lazy de corretor e seguradora
+        from sqlalchemy.orm import joinedload as _jl_prop
+        propostas = (
+            self.session.query(Proposta)
+            .options(
+                _jl_prop(Proposta.corretor),
+                _jl_prop(Proposta.seguradora),
+            )
+            .order_by(Proposta.data_venda.desc())
+            .limit(100)
+            .all()
+        )
 
         def editar_proposta(proposta):
             """Edita uma proposta existente"""
@@ -1237,11 +1430,7 @@ class CorretoraApp:
 
                     dialog.open = False
                     self.page.update()
-
-                    # Recarregar
-                    self.page.clean()
-                    self.build_ui()
-                    self.page.update()
+                    self._refresh_tab(2)
 
                 except Exception as ex:
                     self.show_snackbar(f"❌ Erro: {str(ex)}", self.error_color)
@@ -1377,11 +1566,7 @@ class CorretoraApp:
 
                     dialog.open = False
                     self.page.update()
-
-                    # Recarregar
-                    self.page.clean()
-                    self.build_ui()
-                    self.page.update()
+                    self._refresh_tab(2)
 
                 except Exception as ex:
                     self.show_snackbar(f"❌ Erro: {str(ex)}", self.error_color)
@@ -1403,6 +1588,19 @@ class CorretoraApp:
             dialog.open = True
             self.page.update()
 
+        # Pré-carregar contagem de dependentes em uma única query (elimina N+1)
+        from database import Dependente
+        from sqlalchemy import func as _func_p
+        _prop_ids = [p.id for p in propostas]
+        deps_counts: dict = {}
+        if _prop_ids:
+            deps_counts = dict(
+                self.session.query(Dependente.proposta_id, _func_p.count(Dependente.id))
+                .filter(Dependente.proposta_id.in_(_prop_ids))
+                .group_by(Dependente.proposta_id)
+                .all()
+            )
+
         # Construir lista de propostas
         propostas_list = []
         for proposta in propostas:
@@ -1415,9 +1613,8 @@ class CorretoraApp:
             if proposta.tipo_plano:
                 infos_extras.append(f"🏷️ {proposta.tipo_plano}")
 
-            # Contar dependentes
-            from database import Dependente
-            ndeps = self.session.query(Dependente).filter(Dependente.proposta_id == proposta.id).count()
+            # Contagem de dependentes via mapa pré-carregado (sem query adicional)
+            ndeps = deps_counts.get(proposta.id, 0)
 
             propostas_list.append(
                 ft.Container(
@@ -1497,18 +1694,38 @@ class CorretoraApp:
 
         hoje = date.today()
 
-        # Buscar todos os lançamentos com proposta
+        # Stats via SQL aggregation (1 query, sem carregar objetos em memória)
+        from sqlalchemy import func as _func_l, case as _case_l, and_ as _and_l
+        _stats = (
+            self.session.query(
+                _func_l.count(Lancamento.id).label("total"),
+                _func_l.sum(
+                    _case_l((Lancamento.status_pago == False, Lancamento.valor_esperado), else_=0)
+                ).label("pendente"),
+                _func_l.sum(
+                    _case_l((Lancamento.status_pago == True, Lancamento.valor_esperado), else_=0)
+                ).label("pago"),
+                _func_l.count(
+                    _case_l((_and_l(Lancamento.status_pago == False, Lancamento.data_vencimento < hoje), 1))
+                ).label("vencidos"),
+            )
+            .join(Proposta)
+            .one()
+        )
+        total_lancamentos = _stats.total or 0
+        total_pendente    = float(_stats.pendente or 0)
+        total_pago        = float(_stats.pago or 0)
+        vencidos          = _stats.vencidos or 0
+
+        # Buscar lançamentos — joinedload evita N+1 lazy de proposta
+        from sqlalchemy.orm import joinedload as _jl_lanc
         lancamentos = (
             self.session.query(Lancamento)
-            .join(Proposta)
+            .options(_jl_lanc(Lancamento.proposta))
             .order_by(Lancamento.data_vencimento.asc())
+            .limit(100)
             .all()
         )
-
-        total_lancamentos = len(lancamentos)
-        total_pendente = sum(l.valor_esperado for l in lancamentos if not l.status_pago)
-        total_pago = sum(l.valor_esperado for l in lancamentos if l.status_pago)
-        vencidos = sum(1 for l in lancamentos if not l.status_pago and l.data_vencimento < hoje)
 
         # ---- Funções de ação ----
         def marcar_pago(lancamento):
@@ -1520,9 +1737,7 @@ class CorretoraApp:
                     self.show_snackbar("✅ Lançamento quitado!", self.accent_color)
                     dialog.open = False
                     self.page.update()
-                    self.page.clean()
-                    self.build_ui()
-                    self.page.update()
+                    self._refresh_tab(3)
                 except Exception as ex:
                     self.show_snackbar(f"❌ Erro: {str(ex)}", self.error_color)
 
@@ -1554,9 +1769,7 @@ class CorretoraApp:
                 lancamento.status_pago = False
                 self.session.commit()
                 self.show_snackbar("↩️ Pagamento revertido.", self.primary_color)
-                self.page.clean()
-                self.build_ui()
-                self.page.update()
+                self._refresh_tab(3)
             except Exception as ex:
                 self.show_snackbar(f"❌ Erro: {str(ex)}", self.error_color)
 
@@ -1694,11 +1907,7 @@ class CorretoraApp:
                             ft.FilledButton(
                                 content=ft.Text("🔄 Atualizar", size=13),
                                 style=ft.ButtonStyle(bgcolor=self.primary_color),
-                                on_click=lambda e: (
-                                    self.page.clean(),
-                                    self.build_ui(),
-                                    self.page.update(),
-                                ),
+                                on_click=lambda e: self._refresh_tab(3),
                                 height=40,
                             ),
                         ],
@@ -1724,8 +1933,16 @@ class CorretoraApp:
 
     def build_repasses_tab(self):
         """Constrói a aba de repasses para corretores"""
-        # Buscar todos os corretores
-        corretores = self.session.query(Corretor).all()
+        from database import Proposta, Lancamento as _Lanc
+        from sqlalchemy.orm import subqueryload as _sqload
+        # Eager loading: 3 queries totais ao invés de N×M (elimina N+1 profundo)
+        corretores = (
+            self.session.query(Corretor)
+            .options(
+                _sqload(Corretor.propostas).subqueryload(Proposta.lancamentos)
+            )
+            .all()
+        )
 
         if not corretores:
             return ft.Container(
@@ -2068,130 +2285,209 @@ class CorretoraApp:
             )
 
     def ver_detalhes_corretor(self, corretor):
-        """Mostra detalhes completos do corretor em um dialog"""
+        """Mostra ficha completa do corretor: propostas, leads em negociação e funções."""
         from datetime import date
+        from database import Lead
+        from sqlalchemy.orm import subqueryload as _sqld, joinedload as _jld
 
+        # Recarrega corretor com todos os relacionamentos em 3 queries
+        # (evita N+1 para propostas, lancamentos e seguradora)
+        corretor = (
+            self.session.query(Corretor)
+            .options(
+                _sqld(Corretor.propostas)
+                .subqueryload(Proposta.lancamentos),
+                _sqld(Corretor.propostas)
+                .joinedload(Proposta.seguradora),
+            )
+            .filter_by(id=corretor.id)
+            .one()
+        )
+
+        hoje = date.today()
         propostas = corretor.propostas
-        total_bruto = sum(p.valor_bruto for p in propostas)
         comissao_perc = corretor.comissao_padrao
-        total_comissao = total_bruto * (comissao_perc / 100)
 
-        # Calcular lançamentos
+        # ── Cálculos financeiros ──────────────────────────────────────────────
+        total_bruto = sum(float(p.valor_bruto or 0) for p in propostas)
+        total_comissao = total_bruto * (comissao_perc / 100)
         total_pago = 0.0
         total_pendente = 0.0
-        hoje = date.today()
-
+        total_vencido = 0.0
         for p in propostas:
             for l in p.lancamentos:
+                val = float(l.valor_esperado or 0)
                 if l.status_pago:
-                    total_pago += l.valor_esperado
+                    total_pago += val
                 else:
-                    total_pendente += l.valor_esperado
+                    total_pendente += val
+                    if l.data_vencimento and l.data_vencimento.date() < hoje:
+                        total_vencido += val
 
-        # Linhas de propostas
-        proposta_rows = []
-        for p in propostas:
-            lancamentos_pendentes = sum(1 for l in p.lancamentos if not l.status_pago)
-            proposta_rows.append(
-                ft.Container(
-                    content=ft.Row([
-                        ft.Column([
-                            ft.Text(p.cliente_nome, size=13, weight=ft.FontWeight.BOLD, color=self.text_primary),
-                            ft.Text(
-                                f"Seguradora: {p.seguradora.nome}  |  Venda: {p.data_venda.strftime('%d/%m/%Y')}",
-                                size=11, color=self.text_secondary,
-                            ),
-                        ], spacing=2, expand=True),
-                        ft.Text(f"R$ {p.valor_bruto:,.2f}", size=13, color=self.text_primary),
-                        ft.Container(
-                            content=ft.Text(
-                                f"{lancamentos_pendentes} pend.",
-                                size=11,
-                                color="#fca5a5" if lancamentos_pendentes > 0 else "#86efac",
-                            ),
-                            bgcolor="#450a0a" if lancamentos_pendentes > 0 else "#14532d",
-                            padding=ft.Padding.symmetric(horizontal=8, vertical=3),
-                            border_radius=12,
-                        ),
-                    ], spacing=10),
-                    bgcolor="#1e293b",
-                    padding=10,
-                    border_radius=8,
-                    border=ft.Border.all(1, "#334155"),
-                )
+        # ── Leads em negociação ───────────────────────────────────────────────
+        leads_ativos = self.session.query(Lead).filter(
+            Lead.corretor_id == corretor.id,
+            Lead.status.in_(['NOVO', 'CONTATO', 'QUALIFICADO', 'PROPOSTA']),
+        ).all()
+
+        # ── Seção: Ficha do Corretor ──────────────────────────────────────────
+        def _mini_card(titulo, valor, cor):
+            return ft.Container(
+                content=ft.Column([
+                    ft.Text(titulo, size=10, color=self.text_secondary),
+                    ft.Text(valor, size=15, weight=ft.FontWeight.BOLD, color=cor),
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=2),
+                bgcolor="#1e293b", padding=12, border_radius=8, expand=True,
             )
 
-        content = ft.Column(
-            controls=[
-                # Cabeçalho
-                ft.Row([
-                    ft.Column([
-                        ft.Text(corretor.nome, size=20, weight=ft.FontWeight.BOLD, color=self.text_primary),
-                        ft.Text(corretor.email or "Sem e-mail", size=13, color=self.text_secondary),
-                        ft.Text(corretor.telefone or "Sem telefone", size=13, color=self.text_secondary),
-                    ], spacing=3),
-                    ft.Container(expand=True),
+        ficha_section = ft.Column([
+            ft.Container(
+                content=ft.Row([
                     ft.Container(
                         content=ft.Text(
-                            f"{comissao_perc}%",
-                            size=22, weight=ft.FontWeight.BOLD, color=self.primary_color,
+                            corretor.nome[0].upper(),
+                            size=28, weight=ft.FontWeight.BOLD, color="white",
                         ),
-                        bgcolor="#1e1b4b",
-                        padding=ft.Padding.symmetric(horizontal=16, vertical=8),
-                        border_radius=12,
+                        bgcolor=self.primary_color,
+                        width=56, height=56, border_radius=28,
+                        alignment=ft.Alignment(0, 0),
                     ),
-                ]),
-                ft.Divider(color="#334155"),
-                # Resumo financeiro
+                    ft.Column([
+                        ft.Text(corretor.nome, size=18, weight=ft.FontWeight.BOLD, color=self.text_primary),
+                        ft.Text(f"📧 {corretor.email or 'Sem e-mail'}", size=12, color=self.text_secondary),
+                        ft.Text(f"📱 {corretor.telefone or 'Sem telefone'}", size=12, color=self.text_secondary),
+                    ], spacing=2, expand=True),
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("Comissão", size=10, color=self.text_secondary),
+                            ft.Text(f"{comissao_perc}%", size=22, weight=ft.FontWeight.BOLD, color=self.primary_color),
+                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                        bgcolor="#1e1b4b", padding=ft.Padding.symmetric(horizontal=14, vertical=8), border_radius=10,
+                    ),
+                ], spacing=14),
+                bgcolor="#1e293b", padding=16, border_radius=10,
+                border=ft.Border.all(1, "#334155"),
+            ),
+            ft.Row([
+                _mini_card("Total Apólices", f"R$ {total_bruto:,.2f}", self.text_primary),
+                _mini_card("Comissão Gerada", f"R$ {total_comissao:,.2f}", self.primary_color),
+                _mini_card("Recebido", f"R$ {total_pago:,.2f}", self.accent_color),
+                _mini_card("Pendente", f"R$ {total_pendente:,.2f}", "#f59e0b"),
+                _mini_card("Vencido", f"R$ {total_vencido:,.2f}", self.error_color),
+            ], spacing=8),
+        ], spacing=10)
+
+        # ── Seção: Propostas Fechadas ─────────────────────────────────────────
+        proposta_rows = []
+        for p in propostas:
+            pend = sum(1 for l in p.lancamentos if not l.status_pago)
+            venc = sum(1 for l in p.lancamentos if not l.status_pago and l.data_vencimento and l.data_vencimento.date() < hoje)
+            seg_nome = p.seguradora.nome if p.seguradora else "—"
+            proposta_rows.append(ft.Container(
+                content=ft.Row([
+                    ft.Column([
+                        ft.Text(p.cliente_nome, size=13, weight=ft.FontWeight.BOLD, color=self.text_primary),
+                        ft.Text(f"{seg_nome}  |  {p.data_venda.strftime('%d/%m/%Y') if p.data_venda else '—'}", size=11, color=self.text_secondary),
+                    ], spacing=2, expand=True),
+                    ft.Text(f"R$ {float(p.valor_bruto or 0):,.2f}", size=12, color=self.text_primary),
+                    ft.Container(
+                        content=ft.Text(f"{pend} pend." + (f" | {venc} venc." if venc else ""), size=11,
+                                        color="#fca5a5" if venc > 0 else ("#fde68a" if pend > 0 else "#86efac")),
+                        bgcolor="#450a0a" if venc > 0 else ("#422006" if pend > 0 else "#14532d"),
+                        padding=ft.Padding.symmetric(horizontal=8, vertical=3), border_radius=12,
+                    ),
+                ], spacing=10),
+                bgcolor="#0f172a", padding=10, border_radius=8, border=ft.Border.all(1, "#334155"),
+            ))
+
+        propostas_section = ft.Column([
+            ft.Text(f"📄 Propostas Fechadas ({len(propostas)})", size=14, weight=ft.FontWeight.BOLD, color=self.text_primary),
+            ft.Column(
+                controls=proposta_rows if proposta_rows else [ft.Text("Nenhuma proposta.", color=self.text_secondary, size=13)],
+                spacing=5, scroll=ft.ScrollMode.AUTO, height=180,
+            ),
+        ], spacing=8)
+
+        # ── Seção: Leads em Negociação ────────────────────────────────────────
+        STATUS_COR = {'NOVO': '#3b82f6', 'CONTATO': '#8b5cf6', 'QUALIFICADO': '#f59e0b', 'PROPOSTA': '#10b981'}
+        lead_rows = []
+        for ld in leads_ativos:
+            cor = STATUS_COR.get(ld.status, '#6b7280')
+            dias = (hoje - ld.data_criacao.date()).days if ld.data_criacao else 0
+            ultimo_cont = ld.interacoes[-1].data_interacao.strftime('%d/%m/%Y') if ld.interacoes else "Sem contato"
+            lead_rows.append(ft.Container(
+                content=ft.Row([
+                    ft.Column([
+                        ft.Text(ld.nome, size=13, weight=ft.FontWeight.BOLD, color=self.text_primary),
+                        ft.Text(f"📱 {ld.telefone or '—'}  |  Último contato: {ultimo_cont}", size=11, color=self.text_secondary),
+                    ], spacing=2, expand=True),
+                    ft.Container(
+                        content=ft.Text(ld.status, size=11, color="white", weight=ft.FontWeight.BOLD),
+                        bgcolor=cor, padding=ft.Padding.symmetric(horizontal=8, vertical=3), border_radius=12,
+                    ),
+                    ft.Text(f"{dias}d", size=12, color=self.text_secondary),
+                ], spacing=8),
+                bgcolor="#0f172a", padding=10, border_radius=8, border=ft.Border.all(1, "#334155"),
+            ))
+
+        leads_section = ft.Column([
+            ft.Text(f"🎯 Clientes em Negociação ({len(leads_ativos)})", size=14, weight=ft.FontWeight.BOLD, color=self.text_primary),
+            ft.Column(
+                controls=lead_rows if lead_rows else [ft.Text("Nenhum lead ativo.", color=self.text_secondary, size=13)],
+                spacing=5, scroll=ft.ScrollMode.AUTO, height=160,
+            ),
+        ], spacing=8)
+
+        # ── Seção: Funções e Permissões ───────────────────────────────────────
+        funcoes_section = ft.Container(
+            content=ft.Column([
+                ft.Text("⚙️ Funções e Configurações", size=14, weight=ft.FontWeight.BOLD, color=self.text_primary),
                 ft.Row([
                     ft.Container(
                         content=ft.Column([
-                            ft.Text("Total Apólices", size=11, color=self.text_secondary),
-                            ft.Text(f"R$ {total_bruto:,.2f}", size=16, weight=ft.FontWeight.BOLD, color=self.text_primary),
-                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                        bgcolor="#1e293b", padding=14, border_radius=8, expand=True,
+                            ft.Text("Tipo", size=11, color=self.text_secondary),
+                            ft.Text("Corretor Autônomo", size=13, color=self.text_primary),
+                        ], spacing=2),
+                        bgcolor="#1e293b", padding=12, border_radius=8, expand=True,
                     ),
                     ft.Container(
                         content=ft.Column([
-                            ft.Text("Comissão Total", size=11, color=self.text_secondary),
-                            ft.Text(f"R$ {total_comissao:,.2f}", size=16, weight=ft.FontWeight.BOLD, color=self.primary_color),
-                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                        bgcolor="#1e293b", padding=14, border_radius=8, expand=True,
+                            ft.Text("Comissão Padrão", size=11, color=self.text_secondary),
+                            ft.Text(f"{comissao_perc}% sobre prêmio", size=13, color=self.primary_color),
+                        ], spacing=2),
+                        bgcolor="#1e293b", padding=12, border_radius=8, expand=True,
                     ),
                     ft.Container(
                         content=ft.Column([
-                            ft.Text("Pago", size=11, color=self.text_secondary),
-                            ft.Text(f"R$ {total_pago:,.2f}", size=16, weight=ft.FontWeight.BOLD, color=self.accent_color),
-                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                        bgcolor="#1e293b", padding=14, border_radius=8, expand=True,
+                            ft.Text("Propostas Ativas", size=11, color=self.text_secondary),
+                            ft.Text(str(len(propostas)), size=13, color=self.accent_color),
+                        ], spacing=2),
+                        bgcolor="#1e293b", padding=12, border_radius=8, expand=True,
                     ),
                     ft.Container(
                         content=ft.Column([
-                            ft.Text("Pendente", size=11, color=self.text_secondary),
-                            ft.Text(f"R$ {total_pendente:,.2f}", size=16, weight=ft.FontWeight.BOLD, color=self.error_color),
-                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                        bgcolor="#1e293b", padding=14, border_radius=8, expand=True,
+                            ft.Text("Leads em Aberto", size=11, color=self.text_secondary),
+                            ft.Text(str(len(leads_ativos)), size=13, color="#f59e0b"),
+                        ], spacing=2),
+                        bgcolor="#1e293b", padding=12, border_radius=8, expand=True,
                     ),
-                ], spacing=10),
-                ft.Divider(color="#334155"),
-                ft.Text(f"Propostas ({len(propostas)})", size=15, weight=ft.FontWeight.BOLD, color=self.text_primary),
-                ft.Column(
-                    controls=proposta_rows if proposta_rows else [
-                        ft.Text("Nenhuma proposta.", color=self.text_secondary, size=13)
-                    ],
-                    spacing=6,
-                    scroll=ft.ScrollMode.AUTO,
-                    height=200,
-                ),
-            ],
-            spacing=12,
-            width=620,
-            tight=True,
+                ], spacing=8),
+            ], spacing=10),
+            bgcolor=self.surface_color, padding=14, border_radius=10,
+            border=ft.Border.all(1, "#334155"),
+        )
+
+        # ── Layout final ──────────────────────────────────────────────────────
+        content = ft.Column(
+            controls=[ficha_section, ft.Divider(color="#334155"), propostas_section,
+                      ft.Divider(color="#334155"), leads_section,
+                      ft.Divider(color="#334155"), funcoes_section],
+            spacing=14, width=700, scroll=ft.ScrollMode.AUTO,
         )
 
         dialog = ft.AlertDialog(
-            title=ft.Text(f"👤 Detalhes - {corretor.nome}"),
-            content=content,
+            title=ft.Text(f"👤 Ficha do Corretor — {corretor.nome}"),
+            content=ft.Container(content=content, width=720, height=560),
             actions=[
                 ft.FilledButton(
                     content=ft.Text("Fechar"),
@@ -2276,17 +2572,13 @@ class CorretoraApp:
     def atualizar_repasses(self, e):
         """Atualiza os valores de repasse"""
         self.show_snackbar("Valores atualizados!", self.accent_color)
-        self.page.clean()
-        self.build_ui()
-        self.page.update()
+        self._refresh_tab(4)
 
     def build_financeiro_tab(self):
         """Constrói a aba de Controle Financeiro Completo"""
         from modulo_financeiro import ControleFinanceiro, ContaBancaria, CategoriaFinanceira, TransacaoFinanceira, Meta
         from datetime import datetime, timedelta
         from calendar import monthrange
-
-        print("[DEBUG] Construindo aba Financeiro...")  # Debug
 
         # Inicializar controle financeiro
         controle = ControleFinanceiro(session=self.session)
@@ -2351,8 +2643,13 @@ class CorretoraApp:
         )
 
         # ===== SEÇÃO 2: CONTAS A RECEBER =====
+        # Uma única query; vencidas filtradas em Python (evita 2ª query ao banco)
         contas_receber = controle.obter_contas_receber()
-        contas_receber_vencidas = controle.obter_contas_receber(vencidas=True)
+        _hoje_date = hoje.date()
+        contas_receber_vencidas = [
+            c for c in contas_receber
+            if c.data_vencimento and c.data_vencimento < _hoje_date
+        ]
 
         def marcar_recebido(e, tx_id):
             from modulo_financeiro import TransacaoFinanceira
@@ -2364,9 +2661,7 @@ class CorretoraApp:
                     tx.data_pagamento = date_type.today()
                     self.session.commit()
                 self.show_snackbar("✅ Recebimento registrado!", self.accent_color)
-                self.page.clean()
-                self.build_ui()
-                self.page.update()
+                self._refresh_tab(5)
             except Exception as ex:
                 self.show_snackbar(f"❌ Erro: {str(ex)}", self.error_color)
 
@@ -2427,8 +2722,12 @@ class CorretoraApp:
         )
 
         # ===== SEÇÃO 3: CONTAS A PAGAR =====
+        # Uma única query; vencidas filtradas em Python (evita 2ª query ao banco)
         contas_pagar = controle.obter_contas_pagar()
-        contas_pagar_vencidas = controle.obter_contas_pagar(vencidas=True)
+        contas_pagar_vencidas = [
+            c for c in contas_pagar
+            if c.data_vencimento and c.data_vencimento < _hoje_date
+        ]
 
         pagar_items = []
         for conta in contas_pagar[:10]:  # Mostrar últimas 10
@@ -2483,7 +2782,17 @@ class CorretoraApp:
         )
 
         # ===== SEÇÃO 4: DRE (Demonstração do Resultado) =====
-        dre = controle.gerar_dre(hoje.month, hoje.year)
+        # Reusa o fluxo já carregado na seção 1 — evita 2ª chamada a obter_fluxo_caixa
+        dre = {
+            'periodo': f"{hoje.month:02d}/{hoje.year}",
+            'receita_bruta': fluxo['total_receitas'],
+            'custos_operacionais': fluxo['total_despesas'],
+            'lucro_operacional': fluxo['saldo'],
+            'margem_lucro': (
+                fluxo['saldo'] / fluxo['total_receitas'] * 100
+                if fluxo['total_receitas'] > 0 else 0
+            ),
+        }
 
         dre_section = ft.Container(
             content=ft.Column([
@@ -2535,9 +2844,17 @@ class CorretoraApp:
 
         # ===== SEÇÃO 5: GERENCIAMENTO DE PARCELAS =====
         from sistema_parcelas import Parcela
+        from sqlalchemy.orm import joinedload as _jl_parc
 
-        todas_parcelas = self.session.query(Parcela).order_by(Parcela.data_vencimento).all()
-        parcelas_pendentes = [p for p in todas_parcelas if p.status in ['PENDENTE', 'VENCIDA', 'NOTIFICADA']]
+        # Filtro e limit no SQL — evita carregar todas as parcelas em memória
+        parcelas_pendentes = (
+            self.session.query(Parcela)
+            .filter(Parcela.status.in_(['PENDENTE', 'VENCIDA', 'NOTIFICADA']))
+            .options(_jl_parc(Parcela.corretor), _jl_parc(Parcela.proposta))
+            .order_by(Parcela.data_vencimento)
+            .limit(15)
+            .all()
+        )
 
         def quitar_parcela_ui(parcela_id):
             """Interface para quitar parcela"""
@@ -2546,9 +2863,7 @@ class CorretoraApp:
 
             if gerenciador.quitar_parcela(parcela_id):
                 self.show_snackbar("✅ Parcela quitada!", self.accent_color)
-                self.page.clean()
-                self.build_ui()
-                self.page.update()
+                self._refresh_tab(5)
             else:
                 self.show_snackbar("❌ Erro ao quitar parcela", self.error_color)
 
@@ -2689,9 +3004,7 @@ class CorretoraApp:
                     self.show_snackbar("✅ Transação registrada!", self.accent_color)
                     dialog.open = False
                     self.page.update()
-                    self.page.clean()
-                    self.build_ui()
-                    self.page.update()
+                    self._refresh_tab(5)
                 except Exception as ex:
                     self.show_snackbar(f"❌ Erro: {str(ex)}", self.error_color)
 
@@ -2767,7 +3080,7 @@ class CorretoraApp:
                             ),
                             ft.Text(cat.nome, size=13, color=self.text_primary, expand=True),
                             ft.IconButton(
-                                icon=ft.icons.DELETE_OUTLINE,
+                                icon=ft.Icons.DELETE_OUTLINE,
                                 icon_color=self.error_color,
                                 icon_size=18,
                                 on_click=del_cat,
@@ -2867,9 +3180,7 @@ class CorretoraApp:
                     self.show_snackbar("✅ Meta criada com sucesso!", self.accent_color)
                     dialog.open = False
                     self.page.update()
-                    self.page.clean()
-                    self.build_ui()
-                    self.page.update()
+                    self._refresh_tab(5)
                 except Exception as ex:
                     self.show_snackbar(f"❌ Erro: {str(ex)}", self.error_color)
 
@@ -3013,10 +3324,7 @@ class CorretoraApp:
                 telefone_field.value = ""
                 comissao_field.value = "10.0"
 
-                # Recarregar
-                self.page.clean()
-                self.build_ui()
-                self.page.update()
+                self._refresh_tab(6)
 
             except Exception as ex:
                 self.show_snackbar(f"❌ Erro: {str(ex)}", self.error_color)
@@ -3035,11 +3343,7 @@ class CorretoraApp:
 
                     dialog.open = False
                     self.page.update()
-
-                    # Recarregar
-                    self.page.clean()
-                    self.build_ui()
-                    self.page.update()
+                    self._refresh_tab(6)
 
                 except Exception as ex:
                     self.show_snackbar(f"❌ Erro: {str(ex)}", self.error_color)
@@ -3077,11 +3381,7 @@ class CorretoraApp:
 
                     dialog.open = False
                     self.page.update()
-
-                    # Recarregar
-                    self.page.clean()
-                    self.build_ui()
-                    self.page.update()
+                    self._refresh_tab(6)
 
                 except Exception as ex:
                     self.show_snackbar(f"❌ Erro: {str(ex)}", self.error_color)
@@ -3121,6 +3421,12 @@ class CorretoraApp:
                             ),
                             ft.Row(
                                 controls=[
+                                    ft.OutlinedButton(
+                                        content=ft.Text("ℹ️ Detalhes", size=12),
+                                        style=ft.ButtonStyle(color=self.accent_color),
+                                        tooltip="Ver ficha completa: propostas, leads e funções",
+                                        on_click=lambda e, c=corretor: self.ver_detalhes_corretor(c),
+                                    ),
                                     ft.OutlinedButton(
                                         content=ft.Text("✏️ Editar", size=12),
                                         style=ft.ButtonStyle(
@@ -3216,6 +3522,854 @@ class CorretoraApp:
             expand=True,
         )
 
+    # ─────────────────────────────────────────────────────────
+    #  ASSISTENTE IA
+    # ─────────────────────────────────────────────────────────
+
+    def _get_db_context(self) -> str:
+        """Coleta dados do banco para montar o contexto do assistente (queries otimizadas)."""
+        try:
+            from sqlalchemy import func, case
+            # Corretores — contagem de propostas em 1 query GROUP BY (evita N+1)
+            corretores = self.session.query(Corretor).all()
+            _counts_cor = dict(
+                self.session.query(Proposta.corretor_id, func.count(Proposta.id))
+                .group_by(Proposta.corretor_id)
+                .all()
+            )
+            n_prop_por_cor = {c.id: _counts_cor.get(c.id, 0) for c in corretores}
+            linhas_cor = [
+                f"  • {c.nome} | comissão {c.comissao_padrao}% | {n_prop_por_cor.get(c.id, 0)} propostas"
+                for c in corretores
+            ]
+
+            # Totais com agregação SQL — sem carregar objetos
+            n_propostas = self.session.query(Proposta).count()
+            total_bruto = float(self.session.query(func.sum(Proposta.valor_bruto)).scalar() or 0)
+            row = self.session.query(
+                func.count(Lancamento.id).label("total"),
+                func.sum(case((Lancamento.status_pago == False, Lancamento.valor_esperado), else_=0)).label("val_pend"),
+                func.sum(case((Lancamento.status_pago == True,  Lancamento.valor_esperado), else_=0)).label("val_pago"),
+                func.count(case((Lancamento.status_pago == False, 1))).label("n_pend"),
+                func.count(case((Lancamento.status_pago == True,  1))).label("n_pago"),
+            ).one()
+
+            # Últimas 15 propostas — joinedload evita N+1 lazy de corretor
+            from sqlalchemy.orm import joinedload as _jl_ctx
+            recentes = (
+                self.session.query(Proposta)
+                .options(_jl_ctx(Proposta.corretor))
+                .order_by(Proposta.id.desc())
+                .limit(15)
+                .all()
+            )
+            linhas_prop = [
+                f"  • Proposta #{p.id} | {p.tipo_plano or 'sem tipo'} | "
+                f"R$ {float(p.valor_bruto or 0):.2f} | {p.cliente_nome} | "
+                f"corretor: {p.corretor.nome if p.corretor else '?'}"
+                for p in recentes
+            ]
+
+            ctx = f"""=== DADOS DO SISTEMA ===
+Data/hora atual: {datetime.now().strftime('%d/%m/%Y %H:%M')}
+Usuário logado: {self.usuario_logado.nome_completo if self.usuario_logado else 'desconhecido'}
+
+CORRETORES ({len(corretores)} cadastrados):
+{chr(10).join(linhas_cor) if linhas_cor else '  (nenhum)'}
+
+PROPOSTAS ({n_propostas} no total | R$ {total_bruto:,.2f} em prêmios):
+{chr(10).join(linhas_prop)}
+{'  ...(mais propostas omitidas)' if n_propostas > 15 else ''}
+
+LANÇAMENTOS:
+  Total: {row.total or 0}
+  Pendentes: {row.n_pend or 0} → R$ {float(row.val_pend or 0):,.2f}
+  Pagos: {row.n_pago or 0} → R$ {float(row.val_pago or 0):,.2f}
+========================"""
+            return ctx
+        except Exception as ex:
+            return f"(Erro ao carregar dados: {ex})"
+
+    def _make_msg_bubble(self, role: str, text: str) -> ft.Container:
+        """Cria um balão de mensagem para o chat."""
+        is_user = role == "user"
+        bg = "#3730a3" if is_user else "#1e293b"
+        align = ft.MainAxisAlignment.END if is_user else ft.MainAxisAlignment.START
+        prefix = "Você" if is_user else "🤖 Assistente"
+        prefix_color = "#a5b4fc" if is_user else "#34d399"
+
+        bubble = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text(prefix, size=11, color=prefix_color, weight=ft.FontWeight.BOLD),
+                    ft.Text(text, size=14, color="#f8fafc", selectable=True),
+                ],
+                spacing=4,
+            ),
+            bgcolor=bg,
+            border_radius=12,
+            padding=ft.padding.symmetric(horizontal=16, vertical=10),
+            margin=ft.margin.symmetric(vertical=4),
+            width=680,
+        )
+        return ft.Row([bubble], alignment=align)
+
+    def build_assistente_tab(self):
+        """Constrói a aba do assistente IA com suporte a múltiplos provedores."""
+
+        nomes_provedores = list(AI_PROVIDERS.keys())
+        provedor_atual = [nomes_provedores[0]]  # lista mutável para closure
+
+        # ── Coluna de mensagens ──
+        messages_col = ft.Column([], spacing=4, scroll=ft.ScrollMode.AUTO, expand=True)
+        self._chat_messages_col = messages_col
+
+        def _boas_vindas(prov):
+            return (
+                f"Olá! Sou o Assistente IA da corretora usando {prov}.\n\n"
+                "Posso ajudar com:\n"
+                "• Resumo de propostas e lançamentos\n"
+                "• Situação financeira dos corretores\n"
+                "• Valores pendentes e pagos\n"
+                "• Análises e sugestões\n\n"
+                "Configure sua chave API e comece a perguntar!"
+            )
+
+        messages_col.controls.append(
+            self._make_msg_bubble("assistant", _boas_vindas(provedor_atual[0]))
+        )
+
+        # ── Dropdown de provedor ──
+        provider_dd = ft.Dropdown(
+            options=[ft.dropdown.Option(p) for p in nomes_provedores],
+            value=nomes_provedores[0],
+            width=220,
+            bgcolor="#1e293b",
+            color=self.text_primary,
+            border_color="#334155",
+            focused_border_color=self.primary_color,
+        )
+
+        # ── Campo de chave API ──
+        key_field = ft.TextField(
+            label="Chave API",
+            hint_text=AI_PROVIDERS[nomes_provedores[0]]["hint"],
+            password=True,
+            can_reveal_password=True,
+            value=_load_ai_key(nomes_provedores[0]),
+            border_radius=10,
+            bgcolor="#1e293b",
+            color=self.text_primary,
+            border_color="#334155",
+            focused_border_color=self.primary_color,
+            expand=True,
+        )
+
+        key_status = ft.Text(
+            "Chave configurada" if _load_ai_key(nomes_provedores[0]) else "Sem chave",
+            color=self.accent_color if _load_ai_key(nomes_provedores[0]) else "#f59e0b",
+            size=12,
+        )
+
+        provedor_badge = ft.Container(
+            content=ft.Text(
+                nomes_provedores[0], size=11, color="white", weight=ft.FontWeight.BOLD,
+            ),
+            bgcolor=AI_PROVIDERS[nomes_provedores[0]]["cor"],
+            border_radius=8,
+            padding=ft.padding.symmetric(horizontal=10, vertical=4),
+        )
+
+        def _ao_mudar_provedor(e):
+            prov = provider_dd.value
+            provedor_atual[0] = prov
+            cfg = AI_PROVIDERS[prov]
+            key_field.hint_text = cfg["hint"]
+            key_field.value = _load_ai_key(prov)
+            chave_existente = bool(_load_ai_key(prov))
+            key_status.value = "Chave configurada" if chave_existente else "Sem chave"
+            key_status.color = self.accent_color if chave_existente else "#f59e0b"
+            provedor_badge.content.value = prov
+            provedor_badge.bgcolor = cfg["cor"]
+            self.page.update()
+
+        provider_dd.on_change = _ao_mudar_provedor
+
+        def salvar_chave(e):
+            k = key_field.value.strip()
+            if not k:
+                self.show_snackbar("❌ Digite a chave antes de salvar!", self.error_color)
+                return
+            prov = provedor_atual[0]
+            _save_ai_key(prov, k)
+            key_status.value = "Chave salva!"
+            key_status.color = self.accent_color
+            self.show_snackbar(f"✅ Chave {prov} salva!", self.accent_color)
+            self.page.update()
+
+        save_key_btn = ft.ElevatedButton(
+            "Salvar",
+            icon=ft.Icons.KEY,
+            bgcolor=self.primary_color,
+            color="white",
+            on_click=salvar_chave,
+        )
+
+        key_panel = ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    ft.Text("Provedor:", size=13, color=self.text_secondary),
+                    provider_dd,
+                    provedor_badge,
+                    ft.Container(expand=True),
+                    key_status,
+                ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ft.Row([key_field, save_key_btn], spacing=10),
+            ], spacing=10),
+            bgcolor="#0f172a",
+            border_radius=12,
+            padding=16,
+            border=ft.border.all(1, "#334155"),
+        )
+
+        # ── Botões da toolbar ──
+        loading_ring = ft.ProgressRing(width=22, height=22, stroke_width=3,
+                                        color=self.primary_color, visible=False)
+
+        send_btn = ft.IconButton(
+            icon=ft.Icons.SEND_ROUNDED, icon_color=self.primary_color,
+            icon_size=26, tooltip="Enviar (Enter)",
+        )
+
+        clear_btn = ft.IconButton(
+            icon=ft.Icons.DELETE_OUTLINE, icon_color=self.text_secondary,
+            icon_size=22, tooltip="Limpar conversa",
+        )
+
+        input_field = ft.TextField(
+            hint_text="Digite sua pergunta...",
+            border_radius=12,
+            border_color="#334155",
+            focused_border_color=self.primary_color,
+            bgcolor="#1e293b",
+            color=self.text_primary,
+            hint_style=ft.TextStyle(color=self.text_secondary),
+            expand=True,
+            multiline=True,
+            min_lines=1,
+            max_lines=4,
+            text_size=14,
+        )
+        self._chat_input = input_field
+
+        # ── Lógica de envio ──
+        def _enviar(e):
+            texto = input_field.value.strip()
+            if not texto:
+                return
+            prov = provedor_atual[0]
+            chave = _load_ai_key(prov)
+            if not chave:
+                self.show_snackbar(f"❌ Configure a chave de {prov} antes de enviar!", self.error_color)
+                return
+
+            input_field.value = ""
+            input_field.update()
+
+            messages_col.controls.append(self._make_msg_bubble("user", texto))
+            messages_col.scroll_to(offset=-1, duration=300)
+            messages_col.update()
+
+            loading_ring.visible = True
+            send_btn.disabled = True
+            loading_ring.update()
+            send_btn.update()
+
+            self._chat_history.append({"role": "user", "content": texto})
+
+            def _thread_worker():
+                system_prompt = (
+                    "Você é um assistente financeiro especializado em corretoras de seguros. "
+                    "Responda sempre em português, de forma clara e objetiva. "
+                    "Quando apresentar valores monetários, use o formato R$ com duas casas decimais.\n\n"
+                    + self._get_db_context()
+                )
+                try:
+                    resposta = _chamar_ia(prov, chave, system_prompt, self._chat_history)
+                    self._chat_history.append({"role": "assistant", "content": resposta})
+                except Exception as ex:
+                    resposta = f"❌ Erro ({prov}): {ex}"
+                    self._chat_history.append({"role": "assistant", "content": resposta})
+
+                messages_col.controls.append(self._make_msg_bubble("assistant", resposta))
+                loading_ring.visible = False
+                send_btn.disabled = False
+                messages_col.scroll_to(offset=-1, duration=300)
+                self.page.update()
+
+            threading.Thread(target=_thread_worker, daemon=True).start()
+
+        def _limpar(e):
+            self._chat_history.clear()
+            messages_col.controls.clear()
+            messages_col.controls.append(
+                self._make_msg_bubble("assistant", _boas_vindas(provedor_atual[0]))
+            )
+            self.page.update()
+
+        send_btn.on_click = _enviar
+        clear_btn.on_click = _limpar
+        input_field.on_submit = _enviar
+
+        # ── Layout final ──
+        return ft.Container(
+            content=ft.Column([
+                # Cabeçalho
+                ft.Row([
+                    ft.Text("🤖", size=26),
+                    ft.Column([
+                        ft.Text("Assistente IA", size=18, weight=ft.FontWeight.BOLD, color=self.text_primary),
+                        ft.Text("Claude · ChatGPT · Gemini · Llama", size=11, color=self.text_secondary),
+                    ], spacing=1),
+                    ft.Container(expand=True),
+                    clear_btn,
+                ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                # Config de chave
+                key_panel,
+                ft.Divider(height=1, color="#334155"),
+                # Área de mensagens
+                ft.Container(
+                    content=messages_col,
+                    expand=True,
+                    bgcolor="#0a1628",
+                    border_radius=12,
+                    padding=16,
+                    border=ft.border.all(1, "#1e293b"),
+                ),
+                # Input bar
+                ft.Row([input_field, loading_ring, send_btn],
+                       spacing=8, vertical_alignment=ft.CrossAxisAlignment.END),
+            ], spacing=12, expand=True),
+            padding=20,
+            expand=True,
+        )
+
+    # ─────────────────────────────────────────────────────────
+    #  AGENTE IA (tool use)
+    # ─────────────────────────────────────────────────────────
+
+    def _executar_ferramenta(self, nome: str, params: dict) -> str:
+        """Executa uma ferramenta do agente e retorna o resultado como texto."""
+        try:
+            if nome == "listar_corretores":
+                corretores = self.session.query(Corretor).all()
+                if not corretores:
+                    return "Nenhum corretor cadastrado."
+                # GROUP BY elimina N+1 (1 query para todos os counts)
+                from sqlalchemy import func as _fc_ag
+                _cnt = dict(
+                    self.session.query(Proposta.corretor_id, _fc_ag.count(Proposta.id))
+                    .group_by(Proposta.corretor_id).all()
+                )
+                linhas = [
+                    f"ID {c.id} | {c.nome} | Comissão: {c.comissao_padrao}% | Propostas: {_cnt.get(c.id, 0)}"
+                    for c in corretores
+                ]
+                return "\n".join(linhas)
+
+            elif nome == "listar_propostas":
+                from sqlalchemy.orm import joinedload as _jl_ag
+                q = self.session.query(Proposta).options(_jl_ag(Proposta.corretor))
+                if params.get("corretor_nome"):
+                    c = self.session.query(Corretor).filter(
+                        Corretor.nome.ilike(f"%{params['corretor_nome']}%")).first()
+                    if c:
+                        q = q.filter_by(corretor_id=c.id)
+                limite = int(params.get("limite", 20))
+                propostas = q.limit(limite).all()
+                if not propostas:
+                    return "Nenhuma proposta encontrada."
+                linhas = [
+                    f"ID {p.id} | {p.cliente_nome} | R$ {float(p.valor_bruto or 0):.2f} | Corretor: {p.corretor.nome if p.corretor else '?'}"
+                    for p in propostas
+                ]
+                return "\n".join(linhas)
+
+            elif nome == "listar_lancamentos":
+                from sqlalchemy import and_
+                hoje = datetime.now().date()
+                hoje_dt = datetime.combine(hoje, datetime.min.time())
+                q = self.session.query(Lancamento)
+                if params.get("apenas_vencidos"):
+                    q = q.filter(and_(Lancamento.status_pago == False, Lancamento.data_vencimento < hoje_dt))
+                elif params.get("apenas_pendentes"):
+                    q = q.filter(Lancamento.status_pago == False)
+                limite = int(params.get("limite", 20))
+                lancamentos = q.limit(limite).all()
+                if not lancamentos:
+                    return "Nenhum lançamento encontrado."
+                linhas = []
+                for l in lancamentos:
+                    status = "PAGO" if l.status_pago else ("VENCIDO" if l.data_vencimento and l.data_vencimento.date() < hoje else "PENDENTE")
+                    venc = l.data_vencimento.strftime("%d/%m/%Y") if l.data_vencimento else "?"
+                    linhas.append(f"ID {l.id} | Venc: {venc} | R$ {float(l.valor_esperado or 0):.2f} | {status}")
+                return "\n".join(linhas)
+
+            elif nome == "marcar_lancamento_pago":
+                lid = int(params["lancamento_id"])
+                l = self.session.query(Lancamento).filter_by(id=lid).first()
+                if not l:
+                    return f"Lançamento ID {lid} não encontrado."
+                if l.status_pago:
+                    return f"Lançamento ID {lid} já está pago."
+                l.status_pago = True
+                self.session.commit()
+                return f"✅ Lançamento ID {lid} marcado como PAGO (R$ {float(l.valor_esperado or 0):.2f})."
+
+            elif nome == "resumo_financeiro":
+                from sqlalchemy import func, case, and_
+                hoje_dt = datetime.combine(datetime.now().date(), datetime.min.time())
+                n_corretores = self.session.query(Corretor).count()
+                n_propostas  = self.session.query(Proposta).count()
+                total_bruto  = self.session.query(func.sum(Proposta.valor_bruto)).scalar() or 0
+                row = self.session.query(
+                    func.count(Lancamento.id).label("total"),
+                    func.sum(case((Lancamento.status_pago == True, Lancamento.valor_esperado), else_=0)).label("val_pago"),
+                    func.sum(case((Lancamento.status_pago == False, Lancamento.valor_esperado), else_=0)).label("val_pend"),
+                    func.count(case((Lancamento.status_pago == True, 1))).label("n_pago"),
+                    func.count(case((Lancamento.status_pago == False, 1))).label("n_pend"),
+                ).one()
+                row_venc = self.session.query(
+                    func.count(Lancamento.id).label("n"),
+                    func.sum(Lancamento.valor_esperado).label("val"),
+                ).filter(and_(Lancamento.status_pago == False, Lancamento.data_vencimento < hoje_dt)).one()
+                return (
+                    f"RESUMO FINANCEIRO ({datetime.now().strftime('%d/%m/%Y')})\n"
+                    f"Corretores: {n_corretores} | Propostas: {n_propostas} | Total prêmios: R$ {float(total_bruto):,.2f}\n"
+                    f"Lançamentos: {row.total or 0}\n"
+                    f"  Pagos: {row.n_pago or 0} → R$ {float(row.val_pago or 0):,.2f}\n"
+                    f"  Pendentes: {row.n_pend or 0} → R$ {float(row.val_pend or 0):,.2f}\n"
+                    f"  Vencidos: {row_venc.n or 0} → R$ {float(row_venc.val or 0):,.2f}"
+                )
+
+            elif nome == "buscar_lancamentos_vencidos":
+                from sqlalchemy import and_
+                hoje = datetime.now().date()
+                vencidos = self.session.query(Lancamento).filter(
+                    and_(Lancamento.status_pago == False,
+                         Lancamento.data_vencimento < datetime.combine(hoje, datetime.min.time()))
+                ).all()
+                if not vencidos:
+                    return "Nenhum lançamento vencido."
+                linhas = []
+                for l in vencidos:
+                    cliente = l.proposta.cliente_nome if l.proposta else "?"
+                    dias = (hoje - l.data_vencimento.date()).days
+                    tel = l.proposta.cliente_telefone if l.proposta else None
+                    linhas.append(f"ID {l.id} | Cliente: {cliente} | Tel: {tel or '—'} | R$ {float(l.valor_esperado or 0):.2f} | Vencido há {dias} dias")
+                total = sum(float(l.valor_esperado or 0) for l in vencidos)
+                linhas.append(f"\nTotal vencido: R$ {total:,.2f} ({len(vencidos)} lançamentos)")
+                return "\n".join(linhas)
+
+            elif nome == "gerar_mensagem_followup":
+                from database import Lead
+                lead_id = params.get("lead_id")
+                corretor_nome = params.get("corretor_nome", "")
+                if lead_id:
+                    lead = self.session.query(Lead).filter_by(id=int(lead_id)).first()
+                else:
+                    lead = self.session.query(Lead).filter(
+                        Lead.nome.ilike(f"%{params.get('cliente_nome', '')}%")
+                    ).first()
+                if not lead:
+                    return "Lead não encontrado. Use listar_leads_corretor para ver os IDs disponíveis."
+                ultimo = lead.interacoes[-1] if lead.interacoes else None
+                dias_sem_contato = 0
+                if ultimo:
+                    dias_sem_contato = (datetime.now().date() - ultimo.data_interacao.date()).days
+                obs = f" Última interação há {dias_sem_contato} dias." if dias_sem_contato else ""
+                msg = (
+                    f"Olá {lead.nome.split()[0]}! Tudo bem?\n\n"
+                    f"Sou {corretor_nome or 'da equipe'} e gostaria de dar continuidade à nossa conversa sobre proteção para você e sua família.{obs}\n\n"
+                    f"Posso te apresentar algumas opções que se encaixam no seu perfil. Tem alguns minutinhos para conversarmos?\n\n"
+                    f"Aguardo seu retorno! 😊"
+                )
+                return f"📱 MENSAGEM DE FOLLOW-UP para {lead.nome} ({lead.telefone or 'sem tel'}):\n\n{msg}"
+
+            elif nome == "gerar_mensagem_cobranca":
+                from sqlalchemy import and_
+                hoje = datetime.now().date()
+                lancamento_id = params.get("lancamento_id")
+                if lancamento_id:
+                    l = self.session.query(Lancamento).filter_by(id=int(lancamento_id)).first()
+                else:
+                    # pegar o primeiro vencido como padrão
+                    l = self.session.query(Lancamento).filter(
+                        and_(Lancamento.status_pago == False,
+                             Lancamento.data_vencimento < datetime.combine(hoje, datetime.min.time()))
+                    ).first()
+                if not l:
+                    return "Lançamento não encontrado."
+                cliente = l.proposta.cliente_nome if l.proposta else "Cliente"
+                tel = l.proposta.cliente_telefone if l.proposta else None
+                dias = (hoje - l.data_vencimento.date()).days if l.data_vencimento else 0
+                venc_str = l.data_vencimento.strftime('%d/%m/%Y') if l.data_vencimento else "—"
+                msg = (
+                    f"Olá {cliente.split()[0]}! Tudo bem?\n\n"
+                    f"Passando para informar que identificamos uma parcela do seu seguro em aberto:\n\n"
+                    f"• Valor: R$ {float(l.valor_esperado or 0):,.2f}\n"
+                    f"• Vencimento: {venc_str} ({dias} dias em atraso)\n\n"
+                    f"Para regularizar ou tirar dúvidas, entre em contato conosco. "
+                    f"Evite a suspensão da sua cobertura!\n\n"
+                    f"Estamos à disposição. 🙏"
+                )
+                return f"💰 MENSAGEM DE COBRANÇA para {cliente} ({tel or 'sem tel'}) — Lanç. ID {l.id}:\n\n{msg}"
+
+            elif nome == "listar_leads_corretor":
+                from database import Lead
+                corretor_nome = params.get("corretor_nome", "")
+                status_filtro = params.get("status")
+                q = self.session.query(Lead)
+                if corretor_nome:
+                    c = self.session.query(Corretor).filter(Corretor.nome.ilike(f"%{corretor_nome}%")).first()
+                    if c:
+                        q = q.filter(Lead.corretor_id == c.id)
+                if status_filtro:
+                    q = q.filter(Lead.status == status_filtro.upper())
+                leads = q.all()
+                if not leads:
+                    return "Nenhum lead encontrado."
+                hoje = datetime.now().date()
+                linhas = []
+                for ld in leads:
+                    ultimo = ld.interacoes[-1] if ld.interacoes else None
+                    dias = (hoje - ultimo.data_interacao.date()).days if ultimo else "?"
+                    cor_nome = ld.corretor.nome if ld.corretor else "—"
+                    linhas.append(f"ID {ld.id} | {ld.nome} | {ld.status} | Corretor: {cor_nome} | Sem contato: {dias}d | Tel: {ld.telefone or '—'}")
+                return "\n".join(linhas)
+
+            else:
+                return f"Ferramenta '{nome}' não reconhecida."
+
+        except Exception as ex:
+            return f"Erro ao executar '{nome}': {ex}"
+
+    def build_agente_tab(self):
+        """Constrói a aba do Agente IA com tool use (Claude)."""
+
+        FERRAMENTAS_CLAUDE = [
+            {
+                "name": "listar_corretores",
+                "description": "Lista todos os corretores cadastrados com nome, comissão e número de propostas.",
+                "input_schema": {"type": "object", "properties": {}, "required": []},
+            },
+            {
+                "name": "listar_propostas",
+                "description": "Lista propostas cadastradas. Pode filtrar por nome do corretor.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "corretor_nome": {"type": "string", "description": "Nome parcial do corretor para filtrar"},
+                        "limite": {"type": "integer", "description": "Máximo de resultados (padrão 20)"},
+                    },
+                },
+            },
+            {
+                "name": "listar_lancamentos",
+                "description": "Lista lançamentos financeiros. Pode filtrar por pendentes ou vencidos.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "apenas_pendentes": {"type": "boolean", "description": "Listar só pendentes"},
+                        "apenas_vencidos": {"type": "boolean", "description": "Listar só vencidos"},
+                        "limite": {"type": "integer", "description": "Máximo de resultados"},
+                    },
+                },
+            },
+            {
+                "name": "marcar_lancamento_pago",
+                "description": "Marca um lançamento específico como pago no sistema.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "lancamento_id": {"type": "integer", "description": "ID do lançamento"},
+                    },
+                    "required": ["lancamento_id"],
+                },
+            },
+            {
+                "name": "resumo_financeiro",
+                "description": "Retorna um resumo financeiro completo: totais de propostas, lançamentos pagos, pendentes e vencidos.",
+                "input_schema": {"type": "object", "properties": {}, "required": []},
+            },
+            {
+                "name": "buscar_lancamentos_vencidos",
+                "description": "Lista todos os lançamentos vencidos com cliente, telefone e dias de atraso.",
+                "input_schema": {"type": "object", "properties": {}, "required": []},
+            },
+            {
+                "name": "listar_leads_corretor",
+                "description": "Lista leads/clientes em negociação. Pode filtrar por nome do corretor e status (NOVO, CONTATO, QUALIFICADO, PROPOSTA, GANHO, PERDIDO).",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "corretor_nome": {"type": "string", "description": "Nome parcial do corretor"},
+                        "status": {"type": "string", "description": "Filtrar por status do lead"},
+                    },
+                },
+            },
+            {
+                "name": "gerar_mensagem_followup",
+                "description": "Gera uma mensagem de follow-up personalizada para um cliente/lead que não respondeu. Retorna o texto pronto para enviar via WhatsApp.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "lead_id": {"type": "integer", "description": "ID do lead (use listar_leads_corretor para obter)"},
+                        "cliente_nome": {"type": "string", "description": "Nome parcial do cliente (alternativa ao ID)"},
+                        "corretor_nome": {"type": "string", "description": "Nome do corretor para assinar a mensagem"},
+                    },
+                },
+            },
+            {
+                "name": "gerar_mensagem_cobranca",
+                "description": "Gera uma mensagem de cobrança amigável para um cliente com parcela em atraso. Retorna o texto pronto para enviar.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "lancamento_id": {"type": "integer", "description": "ID do lançamento vencido (use buscar_lancamentos_vencidos para obter)"},
+                    },
+                },
+            },
+        ]
+
+        # ── Estado ──
+        agente_log = ft.Column([], spacing=6, scroll=ft.ScrollMode.AUTO, expand=True)
+        input_tarefa = ft.TextField(
+            hint_text="Descreva a tarefa... ex: 'Liste os lançamentos vencidos e me diga o total'",
+            border_radius=12,
+            border_color="#334155",
+            focused_border_color="#8b5cf6",
+            bgcolor="#1e293b",
+            color=self.text_primary,
+            hint_style=ft.TextStyle(color=self.text_secondary),
+            expand=True,
+            multiline=True,
+            min_lines=1,
+            max_lines=3,
+            text_size=14,
+        )
+
+        executar_btn = ft.ElevatedButton(
+            "Executar Tarefa",
+            icon=ft.Icons.PLAY_ARROW,
+            bgcolor="#8b5cf6",
+            color="white",
+        )
+
+        loading_ring = ft.ProgressRing(width=22, height=22, stroke_width=3,
+                                        color="#8b5cf6", visible=False)
+
+        sugestoes = [
+            "Mostre o resumo financeiro completo",
+            "Liste os lançamentos vencidos e gere uma mensagem de cobrança para o primeiro",
+            "Quais clientes não receberam follow-up? Gere mensagens para eles",
+            "Liste os leads em negociação do corretor Roberto",
+            "Marque o lançamento ID 1 como pago",
+        ]
+
+        def _add_log(tipo: str, texto: str):
+            """Adiciona uma entrada no log do agente."""
+            cores = {
+                "tarefa": ("#3730a3", "📋 Tarefa"),
+                "ferramenta": ("#064e3b", "🔧 Executando"),
+                "resultado": ("#1e3a5f", "📊 Resultado"),
+                "resposta": ("#1e293b", "✅ Agente"),
+                "erro": ("#7f1d1d", "❌ Erro"),
+            }
+            bg, prefixo = cores.get(tipo, ("#1e293b", "•"))
+            agente_log.controls.append(
+                ft.Container(
+                    content=ft.Column([
+                        ft.Text(prefixo, size=11, color=self.text_secondary, weight=ft.FontWeight.BOLD),
+                        ft.Text(texto, size=13, color=self.text_primary, selectable=True),
+                    ], spacing=3),
+                    bgcolor=bg,
+                    border_radius=10,
+                    padding=ft.padding.symmetric(horizontal=14, vertical=10),
+                    border=ft.border.all(1, "#334155"),
+                )
+            )
+            agente_log.scroll_to(offset=-1, duration=200)
+            self.page.update()
+
+        def _executar_agente(e):
+            tarefa = input_tarefa.value.strip()
+            if not tarefa:
+                return
+            chave = _load_ai_key("Claude (Anthropic)")
+            if not chave:
+                self.show_snackbar("❌ Configure a chave Claude (Anthropic) na aba Assistente IA!", self.error_color)
+                return
+
+            input_tarefa.value = ""
+            executar_btn.disabled = True
+            loading_ring.visible = True
+            executar_btn.update()
+            loading_ring.update()
+
+            _add_log("tarefa", tarefa)
+
+            def _loop_agente():
+                try:
+                    import anthropic
+                    client = anthropic.Anthropic(api_key=chave)
+                    system = (
+                        "Você é um agente financeiro especializado em corretoras de seguros. "
+                        "Use as ferramentas disponíveis para responder e executar tarefas no sistema.\n\n"
+                        "Suas capacidades incluem:\n"
+                        "- Consultar corretores, propostas e lançamentos financeiros\n"
+                        "- Marcar lançamentos como pagos\n"
+                        "- Fazer follow-up: use listar_leads_corretor para identificar clientes sem contato recente, "
+                        "  depois gerar_mensagem_followup para criar a mensagem personalizada\n"
+                        "- Cobranças: use buscar_lancamentos_vencidos para identificar inadimplentes, "
+                        "  depois gerar_mensagem_cobranca para criar a notificação de cobrança\n\n"
+                        "Sempre use ferramentas para buscar dados antes de responder. "
+                        "Para follow-up e cobranças, execute as ferramentas em sequência: primeiro liste, depois gere as mensagens. "
+                        "Responda em português, de forma clara e objetiva."
+                    )
+                    mensagens = [{"role": "user", "content": tarefa}]
+                    MAX_ITER = 8
+
+                    for _ in range(MAX_ITER):
+                        resp = client.messages.create(
+                            model="claude-sonnet-4-6",
+                            max_tokens=2048,
+                            system=system,
+                            tools=FERRAMENTAS_CLAUDE,
+                            messages=mensagens,
+                        )
+
+                        # Coleta blocos de texto e tool_use
+                        texto_parcial = []
+                        tool_calls = []
+                        for bloco in resp.content:
+                            if bloco.type == "text" and bloco.text.strip():
+                                texto_parcial.append(bloco.text.strip())
+                            elif bloco.type == "tool_use":
+                                tool_calls.append(bloco)
+
+                        if texto_parcial and not tool_calls:
+                            # Resposta final
+                            _add_log("resposta", "\n".join(texto_parcial))
+                            break
+
+                        if tool_calls:
+                            # Executa cada ferramenta chamada
+                            mensagens.append({"role": "assistant", "content": resp.content})
+                            resultados_tool = []
+                            for tc in tool_calls:
+                                _add_log("ferramenta", f"{tc.name}({tc.input})")
+                                resultado = self._executar_ferramenta(tc.name, tc.input)
+                                _add_log("resultado", resultado)
+                                resultados_tool.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": tc.id,
+                                    "content": resultado,
+                                })
+                            mensagens.append({"role": "user", "content": resultados_tool})
+
+                        if resp.stop_reason == "end_turn":
+                            if texto_parcial:
+                                _add_log("resposta", "\n".join(texto_parcial))
+                            break
+                    else:
+                        _add_log("erro", "Limite de iterações atingido.")
+
+                except Exception as ex:
+                    _add_log("erro", f"Falha no agente: {ex}")
+                finally:
+                    executar_btn.disabled = False
+                    loading_ring.visible = False
+                    self.page.update()
+
+            threading.Thread(target=_loop_agente, daemon=True).start()
+
+        executar_btn.on_click = _executar_agente
+        input_tarefa.on_submit = _executar_agente
+
+        def _limpar_log(e):
+            agente_log.controls.clear()
+            self.page.update()
+
+        # Botões de sugestões
+        def _set_sug(e, texto):
+            input_tarefa.value = texto
+            input_tarefa.update()
+
+        chips = ft.Row(
+            [
+                ft.OutlinedButton(
+                    s,
+                    on_click=lambda e, s=s: _set_sug(e, s),
+                    style=ft.ButtonStyle(color=self.text_secondary),
+                )
+                for s in sugestoes
+            ],
+            wrap=True,
+            spacing=6,
+        )
+
+        return ft.Container(
+            content=ft.Column([
+                # Cabeçalho
+                ft.Row([
+                    ft.Text("⚡", size=26),
+                    ft.Column([
+                        ft.Text("Agente IA", size=18, weight=ft.FontWeight.BOLD, color=self.text_primary),
+                        ft.Text("Executa tarefas automaticamente · Powered by Claude", size=11, color=self.text_secondary),
+                    ], spacing=1),
+                    ft.Container(expand=True),
+                    ft.TextButton("Limpar log", icon=ft.Icons.DELETE_OUTLINE,
+                                  style=ft.ButtonStyle(color=self.text_secondary),
+                                  on_click=_limpar_log),
+                ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+
+                # Sugestões rápidas
+                ft.Container(
+                    content=ft.Column([
+                        ft.Text("Sugestões rápidas:", size=12, color=self.text_secondary),
+                        chips,
+                    ], spacing=6),
+                    bgcolor="#0f172a",
+                    border_radius=10,
+                    padding=12,
+                    border=ft.border.all(1, "#334155"),
+                ),
+
+                ft.Divider(height=1, color="#334155"),
+
+                # Log de execução
+                ft.Container(
+                    content=agente_log,
+                    expand=True,
+                    bgcolor="#0a1628",
+                    border_radius=12,
+                    padding=16,
+                    border=ft.border.all(1, "#1e293b"),
+                ),
+
+                # Input de tarefa
+                ft.Row([
+                    input_tarefa,
+                    loading_ring,
+                    executar_btn,
+                ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.END),
+
+            ], spacing=12, expand=True),
+            padding=20,
+            expand=True,
+        )
+
     def build_config_tab(self):
         """Constrói a aba de configurações"""
         config = ConfigManager(session=self.session)
@@ -3240,9 +4394,7 @@ class CorretoraApp:
                     self.show_snackbar(f"✅ {nome_imposto} atualizado para {novo_valor}%", self.accent_color)
                     dialog.open = False
                     self.page.update()
-                    self.page.clean()
-                    self.build_ui()
-                    self.page.update()
+                    self._refresh_tab(7)
                 except ValueError:
                     self.show_snackbar("❌ Valor inválido!", self.error_color)
 
@@ -3444,9 +4596,7 @@ class CorretoraApp:
         seguradoras = self.session.query(Seguradora).all()
 
         def _voltar():
-            self.page.clean()
-            self.build_ui()
-            self.page.update()
+            self._voltar_ao_app(refresh_tab=2)
 
         # ── helper ────────────────────────────────────────────────────────────
         def _tf(label, valor, width, **kw):
@@ -3641,9 +4791,7 @@ class CorretoraApp:
 
                 msg = f"✅ Proposta #{proposta.id} — {proposta.cliente_nome} salva!"
                 if ndeps: msg += f"  |  {ndeps} dependente(s)"
-                self.page.clean()
-                self.build_ui()
-                self.page.update()
+                self._voltar_ao_app(refresh_tab=2)
                 self.show_snackbar(msg, self.accent_color)
 
             except Exception as ex:
@@ -3968,9 +5116,7 @@ class CorretoraApp:
         COR_TEAL = "#0d9488"
 
         def _voltar():
-            self.page.clean()
-            self.build_ui()
-            self.page.update()
+            self._voltar_ao_app(refresh_tab=3)
 
         def _fmt_val(v):
             if v is None:
@@ -4241,9 +5387,7 @@ class CorretoraApp:
 
                 self.session.commit()
                 total = sum(i.get('valor_comissao', 0) for i in itens_sel)
-                self.page.clean()
-                self.build_ui()
-                self.page.update()
+                self._voltar_ao_app(refresh_tab=3)
                 self.show_snackbar(
                     f"✅ {n} transação(ões) importada(s) — Total: R$ {total:,.2f}",
                     self.accent_color,
@@ -4319,9 +5463,7 @@ class CorretoraApp:
         COR_PURPLE = "#7c3aed"
 
         def _voltar():
-            self.page.clean()
-            self.build_ui()
-            self.page.update()
+            self._voltar_ao_app(refresh_tab=2)
 
         # ── helper ────────────────────────────────────────────────────────────
         def _tf(label, valor, width, **kw):
@@ -4525,9 +5667,7 @@ class CorretoraApp:
                 msg = f"✅ Comissão de R$ {valor_num:,.2f} registrada para {corretor_obj.nome if corretor_obj else ''}!"
                 if npago:
                     msg += f"  |  {npago} lançamento(s) marcado(s) como pago."
-                self.page.clean()
-                self.build_ui()
-                self.page.update()
+                self._voltar_ao_app(refresh_tab=3)
                 self.show_snackbar(msg, self.accent_color)
 
             except Exception as ex:
@@ -4774,10 +5914,7 @@ class CorretoraApp:
     def atualizar_dashboard(self, e):
         """Atualiza os dados do dashboard"""
         self.show_snackbar("Dashboard atualizado!", self.accent_color)
-        # Reconstruir dashboard
-        self.page.clean()
-        self.build_ui()
-        self.page.update()
+        self._refresh_tab(0)
 
     def show_snackbar(self, message, color):
         """Exibe uma notificação"""
@@ -4874,10 +6011,43 @@ class VendedorApp:
         sb.open = True
         self.page.update()
 
+    def _refresh_tab_v(self, idx: int):
+        """Reconstrói apenas uma aba do VendedorApp sem reconstruir tudo."""
+        if not hasattr(self, '_vt_placeholders'):
+            return
+        self._vt_placeholders[idx].content = ft.Column(
+            [ft.ProgressRing(width=28, height=28, stroke_width=3, color=self.primary_color),
+             ft.Text("Atualizando...", color=self.text_secondary, size=13)],
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            alignment=ft.MainAxisAlignment.CENTER, expand=True,
+        )
+        try:
+            self._vt_placeholders[idx].update()
+        except Exception:
+            pass
+        threading.Thread(target=lambda: self._build_vt_async(idx), daemon=True).start()
+
+    def _build_vt_async(self, idx: int):
+        """Constrói uma aba do VendedorApp em thread separada."""
+        try:
+            content = self._vt_builders[idx]()
+        except Exception as ex:
+            content = ft.Text(f"Erro ao carregar aba: {ex}", color=self.error_color)
+        self._vt_placeholders[idx].content = content
+        try:
+            self._vt_placeholders[idx].update()
+        except Exception:
+            pass
+
     def _reload(self):
-        self.page.clean()
-        self.build_ui()
-        self.page.update()
+        """Atualiza todas as abas do painel sem reconstruir a página inteira."""
+        if hasattr(self, '_vt_builders'):
+            for i in range(len(self._vt_builders)):
+                self._refresh_tab_v(i)
+        else:
+            self.page.clean()
+            self.build_ui()
+            self.page.update()
 
     # ── Helpers validação (iguais a CorretoraApp) ─────────────────────────────
     @staticmethod
@@ -4936,31 +6106,68 @@ class VendedorApp:
         )
 
     def _build_tabs(self):
+        """Tabs com lazy loading — cada aba é construída apenas quando acessada."""
+        self._vt_builders = [
+            self._build_dashboard_vendedor,
+            self._build_crm_vendedor,
+            self._build_valor_receber,
+            self._build_extrato_comissoes,
+        ]
+
+        def _placeholder():
+            return ft.Container(
+                content=ft.Column([
+                    ft.ProgressRing(width=28, height=28, stroke_width=3, color=self.primary_color),
+                    ft.Text("Carregando...", color=self.text_secondary, size=13),
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                   alignment=ft.MainAxisAlignment.CENTER, expand=True),
+                expand=True,
+            )
+
+        self._vt_placeholders = [_placeholder() for _ in self._vt_builders]
+        self._vt_construida   = [False] * len(self._vt_builders)
+
+        tab_bar = ft.TabBar(tabs=[
+            ft.Tab(label="📊 Dashboard"),
+            ft.Tab(label="🎯 Meu CRM"),
+            ft.Tab(label="💳 Valor a Receber"),
+            ft.Tab(label="💰 Extrato de Comissões"),
+        ])
+
+        tab_view = ft.TabBarView(controls=self._vt_placeholders, expand=True)
+
+        def _on_tab(e):
+            idx = tab_bar.selected_index or 0
+            if not self._vt_construida[idx]:
+                self._vt_construida[idx] = True
+                threading.Thread(target=lambda i=idx: self._build_vt_async(i), daemon=True).start()
+
+        tab_bar.on_change = _on_tab
+
+        # Dashboard construído imediatamente em background
+        self._vt_construida[0] = True
+        threading.Thread(target=lambda: self._build_vt_async(0), daemon=True).start()
+
         return ft.Container(
-            content=ft.Column([
-                ft.TabBar(tabs=[
-                    ft.Tab(label="📊 Dashboard"),
-                    ft.Tab(label="🎯 Meu CRM"),
-                    ft.Tab(label="💳 Valor a Receber"),
-                    ft.Tab(label="💰 Extrato de Comissões"),
-                ]),
-                ft.TabBarView(controls=[
-                    self._build_dashboard_vendedor(),
-                    self._build_crm_vendedor(),
-                    self._build_valor_receber(),
-                    self._build_extrato_comissoes(),
-                ], expand=True),
-            ], spacing=0, expand=True),
+            content=ft.Column([tab_bar, tab_view], spacing=0, expand=True),
             expand=True,
         )
 
     # ── Dashboard ──────────────────────────────────────────────────────────────
     def _build_dashboard_vendedor(self):
         from database import Lead, Lancamento as _Lanc
-        # KPIs filtrados por corretor
-        propostas = (self.session.query(Proposta)
-                     .filter(Proposta.corretor_id == self.corretor_id).all()
-                     if self.corretor_id else [])
+        from sqlalchemy.orm import subqueryload as _sq, joinedload as _jl
+        # joinedload/subqueryload evita N+1 de lancamentos e seguradora
+        propostas = (
+            self.session.query(Proposta)
+            .options(
+                _sq(Proposta.lancamentos),
+                _jl(Proposta.seguradora),
+            )
+            .filter(Proposta.corretor_id == self.corretor_id)
+            .all()
+            if self.corretor_id else []
+        )
         lans_pendentes = []
         lans_pagos     = []
         for p in propostas:
@@ -5045,7 +6252,7 @@ class VendedorApp:
         filtro = [None]
 
         def _reload_crm():
-            self.page.clean(); self.build_ui(); self.page.update()
+            self._refresh_tab_v(1)  # Apenas a aba CRM (idx=1)
 
         def _fechar(dlg):
             dlg.open = False; self.page.update()
@@ -5244,9 +6451,18 @@ class VendedorApp:
 
     # ── Valor a Receber ────────────────────────────────────────────────────────
     def _build_valor_receber(self):
-        propostas = (self.session.query(Proposta)
-                     .filter(Proposta.corretor_id == self.corretor_id).all()
-                     if self.corretor_id else [])
+        from sqlalchemy.orm import subqueryload as _sq, joinedload as _jl
+        # subqueryload/joinedload evita N+1 de lancamentos e seguradora
+        propostas = (
+            self.session.query(Proposta)
+            .options(
+                _sq(Proposta.lancamentos),
+                _jl(Proposta.seguradora),
+            )
+            .filter(Proposta.corretor_id == self.corretor_id)
+            .all()
+            if self.corretor_id else []
+        )
 
         rows = []
         total_pendente = 0.0
@@ -5335,10 +6551,15 @@ class VendedorApp:
                    .order_by(TransacaoFinanceira.data.desc())
                    .all())
 
-        # Propostas pagas (lançamentos status_pago=True)
-        propostas = (self.session.query(Proposta)
-                     .filter(Proposta.corretor_id == self.corretor_id).all()
-                     if self.corretor_id else [])
+        # Propostas pagas — subqueryload evita N+1 de lancamentos
+        from sqlalchemy.orm import subqueryload as _sq_ext
+        propostas = (
+            self.session.query(Proposta)
+            .options(_sq_ext(Proposta.lancamentos))
+            .filter(Proposta.corretor_id == self.corretor_id)
+            .all()
+            if self.corretor_id else []
+        )
         total_recebido_lans = sum(
             l.valor_esperado for p in propostas for l in p.lancamentos if l.status_pago
         )
@@ -5427,7 +6648,5 @@ def main(page: ft.Page):
 if __name__ == "__main__":
     ft.run(
         main,
-        view=ft.AppView.WEB_BROWSER,
-        host="0.0.0.0",
-        port=8550,
+        view=ft.AppView.FLET_APP,
     )

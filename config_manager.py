@@ -26,31 +26,33 @@ class ConfigManager:
             self.session = session
             self._own_session = False
 
+        self._cache: dict = {}  # cache em memória — evita query por imposto
+        self._cache_loaded = False
+
+    def _ensure_cache(self):
+        """Carrega todas as configurações de uma vez (1 query total)."""
+        if not self._cache_loaded:
+            configs = self.session.query(Configuracao).all()
+            self._cache = {}
+            for c in configs:
+                try:
+                    self._cache[c.chave] = float(c.valor)
+                except (ValueError, TypeError):
+                    self._cache[c.chave] = 0.0
+            self._cache_loaded = True
+
     def get_imposto(self, nome: str) -> float:
         """
-        Obtém o valor de um imposto/alíquota
+        Obtém o valor de um imposto/alíquota (usa cache — evita queries repetidas).
 
         Args:
             nome: Nome da configuração (ex: 'ISS', 'IRPF', 'PIS', etc)
 
         Returns:
             float: Valor da alíquota (retorna 0.0 se não encontrado)
-
-        Exemplo:
-            >>> config = ConfigManager()
-            >>> iss = config.get_imposto('ISS')
-            >>> print(f"ISS: {iss}%")
         """
-        config = self.session.query(Configuracao).filter_by(chave=nome).first()
-
-        if config is None:
-            return 0.0
-
-        try:
-            return float(config.valor)
-        except ValueError:
-            print(f"Aviso: Valor inválido para {nome}: {config.valor}")
-            return 0.0
+        self._ensure_cache()
+        return self._cache.get(nome, 0.0)
 
     def set_imposto(self, nome: str, valor: float) -> bool:
         """
@@ -80,6 +82,11 @@ class ConfigManager:
                 config.valor = str(valor)
 
             self.session.commit()
+            # Atualiza cache
+            try:
+                self._cache[nome] = float(valor)
+            except (ValueError, TypeError):
+                pass
             return True
 
         except Exception as e:
@@ -89,27 +96,13 @@ class ConfigManager:
 
     def listar_impostos(self) -> dict:
         """
-        Lista todos os impostos/alíquotas cadastrados
+        Lista todos os impostos/alíquotas cadastrados.
 
         Returns:
             dict: Dicionário com nome e valor de cada imposto
-
-        Exemplo:
-            >>> config = ConfigManager()
-            >>> impostos = config.listar_impostos()
-            >>> for nome, valor in impostos.items():
-            ...     print(f"{nome}: {valor}%")
         """
-        configs = self.session.query(Configuracao).all()
-
-        impostos = {}
-        for config in configs:
-            try:
-                impostos[config.chave] = float(config.valor)
-            except ValueError:
-                impostos[config.chave] = config.valor
-
-        return impostos
+        self._ensure_cache()
+        return dict(self._cache)
 
     def remover_imposto(self, nome: str) -> bool:
         """
@@ -129,6 +122,7 @@ class ConfigManager:
 
             self.session.delete(config)
             self.session.commit()
+            self._cache.pop(nome, None)  # Remove do cache
             return True
 
         except Exception as e:

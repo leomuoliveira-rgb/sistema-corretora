@@ -120,11 +120,12 @@ class ControleFinanceiro:
         Returns:
             Dict com receitas, despesas e saldo
         """
+        from sqlalchemy.orm import joinedload as _jl
         transacoes = self.session.query(TransacaoFinanceira).filter(
             TransacaoFinanceira.data_transacao >= data_inicio,
             TransacaoFinanceira.data_transacao <= data_fim,
             TransacaoFinanceira.status == 'PAGO'
-        ).all()
+        ).options(_jl(TransacaoFinanceira.categoria)).all()
 
         total_receitas = sum(t.valor for t in transacoes if t.tipo == 'RECEITA')
         total_despesas = sum(t.valor for t in transacoes if t.tipo == 'DESPESA')

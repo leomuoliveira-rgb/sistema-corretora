@@ -3,7 +3,7 @@ Sistema Financeiro de Corretora - Modelos de Banco de Dados
 SQLAlchemy models para gestão de propostas e comissões
 """
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, Date, Boolean, ForeignKey, DateTime, Text
+from sqlalchemy import create_engine, Column, Integer, String, Float, Date, Boolean, ForeignKey, DateTime, Text, event
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime
 import hashlib
@@ -228,7 +228,22 @@ def criar_banco(database_url='sqlite:///corretora.db'):
     except Exception:
         pass
 
-    engine = create_engine(database_url, echo=False)
+    engine = create_engine(
+        database_url,
+        echo=False,
+        connect_args={"check_same_thread": False},
+    )
+
+    # Otimizações SQLite: WAL mode + cache generoso + synchronous normal
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_conn, _record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA cache_size=-16000")  # ~16 MB de cache
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA temp_store=MEMORY")
+        cursor.close()
+
     Base.metadata.create_all(engine)
 
     # Aplicar migrações se necessário
@@ -305,6 +320,27 @@ def aplicar_migracoes(engine):
             cursor.execute("ALTER TABLE dependentes ADD COLUMN estado_civil VARCHAR(50)")
             print("[MIGRAÇÃO] Coluna 'estado_civil' adicionada à tabela dependentes")
 
+        # ── Índices de performance ──────────────────────────────────────────
+        # Criados com IF NOT EXISTS — seguros para rodar múltiplas vezes
+        indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_lanc_status    ON lancamentos(status_pago)",
+            "CREATE INDEX IF NOT EXISTS idx_lanc_venc      ON lancamentos(data_vencimento)",
+            "CREATE INDEX IF NOT EXISTS idx_lanc_proposta  ON lancamentos(proposta_id)",
+            "CREATE INDEX IF NOT EXISTS idx_prop_corretor  ON propostas(corretor_id)",
+            "CREATE INDEX IF NOT EXISTS idx_prop_venda     ON propostas(data_venda)",
+            "CREATE INDEX IF NOT EXISTS idx_lead_status    ON leads(status)",
+            "CREATE INDEX IF NOT EXISTS idx_lead_corretor  ON leads(corretor_id)",
+            "CREATE INDEX IF NOT EXISTS idx_inter_lead     ON interacoes(lead_id)",
+            "CREATE INDEX IF NOT EXISTS idx_parc_status    ON parcelas(status)",
+            "CREATE INDEX IF NOT EXISTS idx_tx_status      ON transacoes_financeiras(status)",
+            "CREATE INDEX IF NOT EXISTS idx_tx_tipo        ON transacoes_financeiras(tipo)",
+        ]
+        for sql in indexes:
+            try:
+                cursor.execute(sql)
+            except Exception:
+                pass
+
         conn.commit()
         conn.close()
 
@@ -314,15 +350,10 @@ def aplicar_migracoes(engine):
 
 def obter_sessao(engine):
     """
-    Cria e retorna uma sessão do SQLAlchemy
-
-    Args:
-        engine: Engine do SQLAlchemy
-
-    Returns:
-        Session: Objeto de sessão do SQLAlchemy
+    Cria e retorna uma sessão do SQLAlchemy.
+    expire_on_commit=False: objetos salvos continuam acessíveis sem re-query.
     """
-    Session = sessionmaker(bind=engine)
+    Session = sessionmaker(bind=engine, expire_on_commit=False)
     return Session()
 
 
